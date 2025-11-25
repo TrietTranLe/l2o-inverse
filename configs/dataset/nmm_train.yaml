@@ -1,0 +1,18 @@
+datafolder: '/home/triet/Documents/DATA2/simulation'
+
+n_times: 500
+n_sources: 994 
+n_electrodes: 90
+
+#head model 
+subject_name: 'fsaverage'
+orientation: 'constrained'
+electrode_montage: 'standard_1020'
+source_sampling: 'fsav_994'
+
+# simulation
+spike_simu_name: "nmm_spikes_nov23_train"
+metadata_name: "_nmm_spikes_nov23_train_"
+
+sampling_rate: 512
+to_load: 10000

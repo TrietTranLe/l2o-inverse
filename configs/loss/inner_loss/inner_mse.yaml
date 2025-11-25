@@ -1,0 +1,18 @@
+_target_: losses.expression_composer.ExpressionLossComposer
+
+terms:
+  - name: data
+    fn:
+      _target_: losses.builtins.mse.MSE
+    expr: "fn(y, L @ x)"
+    weight: 1.0
+
+  - name: reg
+    fn:
+      _target_: losses.builtins.mse.MSE
+    expr: "fn(x, AE(x))"
+    weight: 1.0
+
+L:
+  _target_: data.eeg.utils_eeg.build_leadfield_tensor
+  forward_obj: ${fwd}

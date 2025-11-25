@@ -1,0 +1,7 @@
+_target_: models.autoencoder.Conv1DAE
+dim_in: ${dataset.n_sources}
+dim_hidden: 128
+dim_out: ${dataset.n_sources}
+kernel_size: 3
+bias: False
+fixed: false

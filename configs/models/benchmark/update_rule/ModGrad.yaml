@@ -1,0 +1,2 @@
+_target_: models.update_rule.LRUR
+lr: 1e-3

@@ -1,0 +1,4 @@
+_target_: models.benchmark.grad_mod.MetaCurvature
+dim_out: ${dataset.n_sources}
+dim_in: ${dataset.n_times}
+dim_f: 1

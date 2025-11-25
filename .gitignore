@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual env
+.env
+.venv
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch Lightning logs
+lightning_logs/
+tb_logs/
+
+# Hydra outputs
+multirun/
+outputs/
+hydra/
+
+# Checkpoints
+*.ckpt
+*.pt

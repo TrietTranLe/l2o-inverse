@@ -1,0 +1,60 @@
+defaults: 
+  - _self_
+  - loss/inner_loss: inner_cosine
+  - loss/outer_loss: outer_cosine
+  - models/autoencoder: Conv1DAE
+  - models/benchmark/grad_mod: 4DVarNet
+  - models/benchmark/update_rule: 4DVarNet
+  - trainer: base_trainer
+  - dataset: ses_sereega_fsav994_125ms
+
+datamodule: 
+  _target_: data.eeg.data.EsiDatamodule
+  dataset_kw: 
+    datafolder: ${dataset.datafolder}
+    simu_name: ${dataset.simu_name}
+    subject_name: ${dataset.subject_name}
+    source_sampling: ${dataset.source_sampling}
+    electrode_montage: ${dataset.electrode_montage}
+    orientation: ${dataset.orientation}
+    to_load: ${dataset.to_load}
+    snr_db: 5
+    noise_type: {"white":1.}
+    scaler_type: 'linear_bis'
+    replace_root: True
+  subset_name: none
+  dl_kw:
+    batch_size: 32
+  time_window: False
+
+fwd: 
+  _target_: data.eeg.utils_eeg.load_fwd_fsav
+  datafolder: ${dataset.datafolder}
+  head_model_dict: 
+    subject_name: ${dataset.subject_name}
+    orientation: ${dataset.orientation}
+    electrode_montage: ${dataset.electrode_montage}
+    source_sampling: ${dataset.source_sampling}
+  fwd_name: 'fwd_fsav_994-fwd.fif'
+  scaler_type: ${datamodule.dataset_kw.scaler_type}
+
+l2o:
+  _target_: optimizers.l2o_optimizer.EsiGradSolver
+  reg_net: ${models.autoencoder}
+  grad_mod: ${models.benchmark.grad_mod}
+  update_rule: ${models.benchmark.update_rule}
+  inner_loss: ${loss.inner_loss}
+  n_steps: 10
+  fwd: ${fwd}
+
+litmodel:
+  _target_: trainers.lit_bilevel.LitBiLevel
+  l2o: ${l2o}
+  outer_opt_cfg:
+    name: adam
+    lr: 5e-5
+    lr_groups:
+      grad_mod: 5e-5
+      reg_net: 2.5e-5
+  inner_steps: 10
+  outer_loss: ${loss.outer_loss}

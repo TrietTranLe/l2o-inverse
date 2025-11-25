@@ -1,0 +1,14 @@
+_target_: losses.expression_composer.ExpressionLossComposer
+
+terms:
+  - name: data
+    fn:
+      _target_: losses.builtins.mse.MSE
+    expr: "fn(x_inner, x_true)"
+    weight: 1.0
+
+  - name: reg
+    fn:
+      _target_: losses.builtins.mse.MSE
+    expr: "fn(x_inner, AE(x_inner))"
+    weight: 1.0

@@ -1,0 +1,5 @@
+_target_: models.grad_mod.x_grad_mod_mul
+dim_in: ${dataset.n_sources}
+dim_hidden: 48
+kernel_size: 3
+dropout: 0.1

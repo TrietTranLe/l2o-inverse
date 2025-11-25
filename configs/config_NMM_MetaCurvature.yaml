@@ -1,0 +1,62 @@
+defaults: 
+  - _self_
+  - loss/inner_loss: inner_cosine
+  - loss/outer_loss: outer_cosine
+  - models/autoencoder: Conv1DAE
+  - models/benchmark/grad_mod: MetaCurvature
+  - models/benchmark/update_rule: MetaCurvature
+  - trainer: base_trainer
+  - dataset: nmm_train
+
+datamodule: 
+  _target_: data.eeg.data.NMMDatamodule
+  dataset_kw:
+    datafolder: ${dataset.datafolder}
+    spike_simu_name: ${dataset.spike_simu_name}
+    metadata_name: ${dataset.metadata_name}
+    subject_name: ${dataset.subject_name}
+    source_sampling: ${dataset.source_sampling}
+    electrode_montage: ${dataset.electrode_montage}
+    orientation: ${dataset.orientation}
+    # fwd_regions_name: ${dataset.fwd_regions_name}
+    fwd: ${fwd}
+    spos: none
+    n_times: ${dataset.n_times}
+    transform: none
+    args_params: none
+    scaler_type: "linear"
+    to_load: ${dataset.to_load}
+  dl_kw: 
+    batch_size: 32
+
+fwd: 
+  _target_: data.eeg.utils_eeg.load_fwd_fsav
+  datafolder: ${dataset.datafolder}
+  head_model_dict: 
+    subject_name: ${dataset.subject_name}
+    orientation: ${dataset.orientation}
+    electrode_montage: ${dataset.electrode_montage}
+    source_sampling: ${dataset.source_sampling}
+  fwd_name: 'fwd_fsav_994-fwd.fif'
+  scaler_type: ${datamodule.dataset_kw.scaler_type}
+
+l2o:
+  _target_: optimizers.l2o_optimizer.EsiGradSolver
+  reg_net: ${models.autoencoder}
+  grad_mod: ${models.benchmark.grad_mod}
+  update_rule: ${models.benchmark.update_rule}
+  inner_loss: ${loss.inner_loss}
+  n_steps: 10
+  fwd: ${fwd}
+
+litmodel:
+  _target_: trainers.lit_bilevel.LitBiLevel
+  l2o: ${l2o}
+  outer_opt_cfg:
+    name: adam
+    lr: 5e-5
+    lr_groups:
+      grad_mod: 5e-5
+      reg_net: 2.5e-5
+  inner_steps: 10
+  outer_loss: ${loss.outer_loss}
