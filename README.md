@@ -179,7 +179,7 @@ L:
 
 ---------------------------------------------------------------------
 
-# 10. Audience
+# 7. Audience
 
 This repository is intended for:
 - researchers in inverse problems
@@ -190,7 +190,7 @@ This repository is intended for:
 
 ---------------------------------------------------------------------
 
-# 11. Citation
+# 8. Citation
 
 (Coming soon)
 
