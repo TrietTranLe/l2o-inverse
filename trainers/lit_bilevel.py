@@ -56,7 +56,7 @@ class LitBiLevel(pl.LightningModule):
         self.outer_loss = outer_loss
 
         # Save hyperparameters (Lightning stores non-module arguments)
-        self.save_hyperparameters(ignore=["l2o"])
+        self.save_hyperparameters(ignore=["l2o", "outer_loss"])
 
     # -------------------------------------------------------------------------
     def forward(self, x):
