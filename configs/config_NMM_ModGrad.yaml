@@ -8,6 +8,11 @@ defaults:
   - trainer: base_trainer
   - dataset: nmm_train
 
+job_id: "abc"
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_${job_id}
+
 datamodule: 
   _target_: data.eeg.data.NMMDatamodule
   dataset_kw:
