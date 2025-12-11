@@ -131,16 +131,12 @@ class MetaCurvature(nn.Module):
         
 
 class ModGrad(nn.Module):
-    def __init__(self, dim_in, dim_t, dim_hidden, num_filters=64, kernel_size=3, num_plastic=300, num_mix=5):
+    def __init__(self, dim_in, dim_hidden, num_filters=64, kernel_size=1, num_plastic=300, num_mix=5):
         super().__init__()
-        # self.num_filters = num_filters
-        # self.kernel_size = kernel_size
+        self.num_filters = num_filters
+        self.kernel_size = kernel_size
         # self.num_plastic = num_plastic
-        
-        self.num_filters = dim_t
-        self.kernel_size = 1
         self.num_plastic = dim_hidden*dim_hidden
-        
         self.num_mix = num_mix
 
         self.uu_3 = nn.Sequential(nn.Linear(self.num_plastic, self.num_filters * self.kernel_size),

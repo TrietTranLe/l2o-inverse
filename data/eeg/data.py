@@ -692,7 +692,7 @@ class ModSpikeEEGBuild(Dataset):
             datafolder, subject_name, orientation, electrode_montage, source_sampling,
             "simu", metadata_name, f"{metadata_name}.mat"
         )
-
+        
         # fwd_file_path = Path(
         #     datafolder, subject_name, orientation, electrode_montage, source_sampling,
         #     "model", fwd_regions_name
@@ -844,7 +844,6 @@ class NMMDatamodule(pl.LightningDataModule):
         self.val_ds = None
 
         self.dataset_kw = dataset_kw
-        print(self.dataset_kw)
 
     def setup(self, stage):
         if stage == "test": 

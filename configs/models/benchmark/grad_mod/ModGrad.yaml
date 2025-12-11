@@ -1,4 +1,3 @@
 _target_: models.benchmark.grad_mod.ModGrad
 dim_in: ${dataset.n_sources}
-dim_t: ${dataset.n_times}
 dim_hidden: 48

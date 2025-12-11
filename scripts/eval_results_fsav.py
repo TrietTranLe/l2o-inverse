@@ -448,7 +448,8 @@ for k in tqdm(range(n_val_samples)):
     for k, v in full_terms.items():
         full_terms[k] = np.array(v).mean()
     rows = np.array([full_terms['data'] + full_terms['reg'], full_terms['data'], full_terms['reg']])
-np.savetxt(Path(output_dir, "Lower_Cost.csv"), rows, delimiter=",", fmt='%.15f')
+with open(Path(output_dir, "Lower_Cost.csv"), "w+") as f:
+    np.savetxt(Path(output_dir, "Lower_Cost.csv"), rows, delimiter=",", fmt='%.15f')
 
 #####################################################################
 #############################################################################
