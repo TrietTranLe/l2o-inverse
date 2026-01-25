@@ -14,5 +14,5 @@ source_sampling: 'fsav_994'
 spike_simu_name: "nmm_spikes_nov23_train"
 metadata_name: "_nmm_spikes_nov23_train_"
 
-sampling_rate: 512
+sampling_rate: 500
 to_load: 10000

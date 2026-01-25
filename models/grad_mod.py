@@ -72,7 +72,7 @@ class x_grad_mod_mul(ConvLstmGradMod):
             self.down(torch.zeros(size, device=inp.device)),
         ]
 
-    def forward(self, x, grad_x, inner_loss=None):
+    def forward(self, x, grad_x, bounds=None):
         x = einops.rearrange(x, self.rearrange_bef)
         grad_x = einops.rearrange(grad_x, self.rearrange_bef)
 
@@ -94,58 +94,15 @@ class x_grad_mod_mul(ConvLstmGradMod):
         grad_x_fea = self.up(self.decoder_grad(grad_x_fea))
         P = self.up(self.decoder(P))
         P = P*grad_x_fea
-        if inner_loss is not None:
-            P_min, P_max = self.hessian_bound(inner_loss, x, grad_x)
+        if bounds is not None:
+            P_min, P_max = bounds
             P = self._clamp_P(P, P_min, P_max)
-
+        
         # gradients[-1].append((P).detach().to('cpu').squeeze().numpy())
         # gradients[-1].append(grad_x.detach().to('cpu').squeeze().numpy())
         out = P*grad_x
         # gradients[-1].append(out.detach().to('cpu').squeeze().numpy())
-        return einops.rearrange(out, self.rearrange_aft) #, gradients
-
-    def hessian_bound(self, loss, x, grad=None, iters=3, safety=1.25, eps=1e-8):
-        single_input = (loss.dim() == 0)
-        if single_input:
-            loss = loss.unsqueeze(0)
-            if x.dim() > 1:
-                x = x.unsqueeze(0)
-            else:
-                x = x.view(1, -1)
-
-        b = x.shape[0]
-        flat_dim = x[0].numel()
-
-        if grad is None:
-            grad = torch.autograd.grad(
-                outputs=loss, inputs=x,
-                grad_outputs=torch.ones_like(loss),
-                create_graph=True, retain_graph=True
-            )[0]
-
-        grads_flat = grad.view(b, -1)
-
-        v = torch.randn_like(grads_flat)
-        v = v / (v.norm(dim=1, keepdim=True) + eps)
-        lam = None
-        for _ in range(iters):
-            gv = (grads_flat * v).sum(dim=1)  # shape (b,)
-            Hv = torch.autograd.grad(
-                outputs=gv, inputs=x,
-                grad_outputs=torch.ones_like(gv),
-                retain_graph=True, create_graph=True, allow_unused=True
-            )[0]
-            if Hv is None:
-                Hv = torch.zeros_like(x)
-            Hv_flat = Hv.view(b, -1)
-
-            normHv = Hv_flat.norm(dim=1, keepdim=True) + eps
-            v = Hv_flat / normHv
-            lam = normHv.squeeze(1)  # shape (b,)
-
-        P_max = 1.999/(safety * lam)
-        P_min = torch.zeros_like(P_max)
-        return P_min, P_max
+        return einops.rearrange(out, self.rearrange_aft), einops.rearrange(P, self.rearrange_aft)
 
     def _clamp_P(self, P, P_min=None, P_max=None):
         """

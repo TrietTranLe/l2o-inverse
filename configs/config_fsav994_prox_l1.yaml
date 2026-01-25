@@ -4,7 +4,7 @@ defaults:
   - loss/outer_loss: outer_cosine
   - models/autoencoder: Conv1DAE
   - models/grad_mod: x_grad_mod_mul
-  - models/update_rule: GradientDescentUR
+  - models/update_rule: prox_MM_l1_UR
   - trainer: base_trainer
   - dataset: ses_sereega_fsav994_125ms
 
@@ -52,6 +52,7 @@ l2o:
   n_steps: 10
   bound_estimating_steps: 3
   fwd: ${fwd}
+
 
 litmodel:
   _target_: trainers.lit_bilevel.LitBiLevel

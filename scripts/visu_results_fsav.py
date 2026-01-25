@@ -20,22 +20,17 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from hydra import compose, initialize
+from hydra import compose, initialize, initialize_config_dir
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from torch import nn
 
-from contrib.eeg.data import EsiDatamodule, EsiDataset
-from contrib.eeg.prior import ConvAEPrior
-from contrib.eeg.grad_models import RearrangedConvLstmGradModel_n
-from contrib.eeg.solvers import EsiBaseObsCost, EsiGradSolver_n, EsiLitModule
-from contrib.eeg.optimizers import optim_adam_gradphi
-from contrib.eeg.cost_funcs import Cosine, CosineReshape
-from contrib.eeg.models_directinv import HeckerLSTM, HeckerLSTMpl
-from contrib.eeg.utils_eeg import (load_fwd, load_mne_info,
+from data.eeg.data import EsiDatamodule, EsiDataset
+from losses.builtins.cosine import CosineSimilarityFlatLoss
+from data.eeg.utils_eeg import (load_fwd, load_mne_info,
                                    load_model_from_conf, plot_source_estimate,
                                    plot_src_from_imgs)
-from contrib.eeg.utils_eeg import signal_to_windows, windows_to_signal, windows_to_signal_center
+from data.eeg.utils_eeg import signal_to_windows, windows_to_signal, windows_to_signal_center
 from scipy.io import loadmat
 
 home = os.path.expanduser('~')
@@ -67,8 +62,10 @@ hemi = "lh" if args.subset_name.split('_')[0]=="left" else "rh"
 pl.seed_everything(333)
 device = torch.device("cpu")
 
-output_dir = args.output_dir
-config_path = Path( f"{args.output_dir}", ".hydra" )
+ROOT = Path(__file__).resolve().parents[1]
+
+output_dir = Path(ROOT, args.output_dir)
+config_path = Path(output_dir, ".hydra")
 #overrides_name = Path("overrides.yaml")
 ## load the overrides file
 #overr = OmegaConf.load(Path(config_path, overrides_name))
@@ -76,12 +73,12 @@ config_path = Path( f"{args.output_dir}", ".hydra" )
 #    overr = overr + args.add_overrides
 
 # init hydra config
-with initialize(config_path=str(config_path), version_base=None):
+with initialize_config_dir(config_dir=str(config_path), version_base=None):
     cfg = compose(config_name="config.yaml")#, overrides=overr)
 
 TrainingItem = namedtuple('TrainingItem', ['input', 'tgt'])
 
-test_data_config = str(Path('config', 'dataset', args.test_data_config))
+test_data_config = str(Path('configs', 'dataset', args.test_data_config))
 test_config = OmegaConf.load(test_data_config)
 if args.test_overrides :
     for override in args.test_overrides : 
@@ -117,7 +114,7 @@ datamodule_conf = {
     # "time_window":args.time_window
 }
 cfg.datamodule = datamodule_conf
-cfg.fwd._target_ = "contrib.eeg.utils_eeg.load_fwd_fsav"
+cfg.fwd._target_ = "data.eeg.utils_eeg.load_fwd_fsav"
 if args.on_train : 
     dm = hydra.utils.call(cfg.datamodule)
 else:
@@ -166,9 +163,9 @@ else:
     sys.exit()
 
 litmodel = hydra.utils.call(cfg.litmodel)
-if litmodel.solver.init_type == "direct":
+if litmodel.l2o.init_type == "direct":
     init_model = hydra.utils.call(cfg.init_model.model)
-    litmodel.solver.load_init_model(init_model)
+    litmodel.l2o.load_init_model(init_model)
 loaded_mod = torch.load(model_path, map_location=torch.device('cpu'))
 litmodel.load_state_dict( loaded_mod['state_dict'] )
 litmodel.eval()
@@ -177,7 +174,7 @@ litmodel.eval()
 baselines = args.baselines
 baseline_config_path=args.baseline_config
 baseline_nets = dict(zip(baselines, []*len(baselines)))
-baseline_config = OmegaConf.load( str(Path("baselines", baseline_config_path)) )
+baseline_config = OmegaConf.load(str(Path(ROOT, "configs", "baselines", baseline_config_path)))
 # baseline_config =  OmegaConf.load(args.baseline_config)
 for bsl in baselines: 
     baseline_nets[bsl] = load_model_from_conf(bsl, baseline_config)
@@ -205,6 +202,13 @@ TrainingItem = namedtuple('TrainingItem', ['input', 'tgt']) # batch format for 4
 eeg, src = dm.test_ds[idx_v]
 batch = TrainingItem(input=eeg.unsqueeze(0), tgt=src.unsqueeze(0))
 idx_v = 0
+
+try:
+    if litmodel.l2o.update_rule.mode == "proj_Dl1ball":
+        c = torch.norm(batch.tgt.view(-1), p=1).item()
+        litmodel.l2o.update_rule.lambda_l1 = 1.5*c
+except AttributeError:
+    pass
 
 #----
 ## Visu the GT data
@@ -254,16 +258,17 @@ with torch.no_grad():
         windows_input = signal_to_windows(batch.input, window_length=window_length, overlap=overlap, pad=True) 
         windows_tgt = signal_to_windows(batch.tgt, window_length=window_length, overlap=overlap, pad=True) 
         windows = TrainingItem(input=windows_input.squeeze(), tgt=windows_tgt.squeeze())
-        output = litmodel(windows)
+        output, inner_losses, full_terms = litmodel.l2o(windows_tgt, windows_input, return_all=True)
         # output = windows.tgt
-        output_ae = litmodel.solver.prior_cost.forward_ae( litmodel(windows) ) # check the output of the prior model
+        output_ae = litmodel.l2o.reg_net(output)
         output = torch.from_numpy( windows_to_signal(output.unsqueeze(1), overlap=overlap, n_times=batch.input.shape[-1]) )
         output_ae = torch.from_numpy( windows_to_signal(output_ae.unsqueeze(1), overlap=overlap, n_times=batch.input.shape[-1]) )
     else : 
-        output = litmodel(batch).detach()
-        output_ae = litmodel.solver.prior_cost.forward_ae( litmodel(batch) ) # check the output of the prior model
-        gt_ae = litmodel.solver.prior_cost.forward_ae( batch.tgt ) 
-        
+        output, inner_losses, full_terms = litmodel.l2o(batch.tgt, batch.input, return_all=True)
+        output = output.detach()
+        output_ae = litmodel.l2o.reg_net(output)
+        gt_ae = litmodel.l2o.reg_net(batch.tgt).detach()
+
         # output = torch.matmul(litmodel(batch), batch.input).detach()
         # output_ae = torch.matmul(litmodel.solver.prior_cost.forward_ae( litmodel(batch)), batch.input)
         # gt_ae = litmodel.solver.prior_cost.forward_ae(batch.tgt)
@@ -305,14 +310,22 @@ with torch.no_grad():
         
 plt.figure(figsize=(10,5))
 plt.subplot(121)
+x_max = batch.tgt[idx_v,:,:].squeeze().abs().max().numpy()
 for s in range(test_config.n_sources):
-    plt.plot(batch.tgt[idx_v,s,:].squeeze().numpy())
+    norm_x_plot = batch.tgt[idx_v,s,:].squeeze().numpy()
+    norm_x_plot = norm_x_plot/x_max
+    plt.plot(norm_x_plot)
+    # plt.plot(batch.tgt[idx_v,s,:].squeeze().numpy())
 plt.xlabel('Time points')
 plt.ylabel('Amplitude')
 plt.title('source GT data')
 plt.subplot(122)
+x_max = output[idx_v,:,:].squeeze().abs().max().numpy()
 for s in range(test_config.n_sources): 
-    plt.plot(output[idx_v,s,:].squeeze().numpy())
+    norm_x_plot = output[idx_v,s,:].squeeze().numpy()
+    norm_x_plot = norm_x_plot/x_max
+    plt.plot(norm_x_plot)
+    # plt.plot(output[idx_v,s,:].squeeze().numpy())
 plt.xlabel('Time points')
 plt.ylabel('Amplitude')
 plt.title('Source estimated')
@@ -375,8 +388,8 @@ plt.show(block=False)
 
 #####
 # compute metrics on the given data
-from contrib.eeg import utils_eeg as utl
-from contrib.eeg import metrics as met
+from data.eeg import utils_eeg as utl
+from . import metrics as met
 seeds = dm.test_ds.md[idx]["seeds"]
 if type(seeds) is int:
     seeds = [seeds]
@@ -545,23 +558,21 @@ if args.show:
 else: 
     plt.close()
 
-
 ## Variational cost during the gradient descent (and obs and prior cost separately)
+varc = list(np.array(full_terms["data"]) + np.array(full_terms["reg"]))
 plt.figure(figsize=(15,5))
 plt.subplot(1,3,1)
-if litmodel.solver.varc[0].requires_grad:
-    litmodel.solver.varc = [t.detach() for t in litmodel.solver.varc]
-plt.plot(litmodel.solver.varc, '-', marker='o')
+plt.plot(varc, '-', marker='o')
 plt.xlabel('step')
 plt.title("var cost")
 
 plt.subplot(1,3,2)
-plt.plot( litmodel.solver.obsc, '-', marker='o' )
+plt.plot(full_terms["data"], '-', marker='o' )
 plt.title("obs cost")
 plt.xlabel('step')
 
 plt.subplot(1,3,3)
-plt.plot( litmodel.solver.pc, '-',  marker='o')
+plt.plot(full_terms["reg"], '-',  marker='o')
 plt.title("prior cost")
 plt.xlabel('step')
 plt.savefig(Path(figs_path,f"var_cost_idx_{idx}.png"))
@@ -604,7 +615,7 @@ if args.show:
 else:
     plt.close()
 #---
-coss = CosineReshape()
+coss = CosineSimilarityFlatLoss()
 
 print(f"4DVAR cossim: {coss(output.detach(), batch.tgt.detach()):.4f}")
 print(f"LSTM cossim: {coss(lstm_output, batch.tgt.detach()):.4f}")

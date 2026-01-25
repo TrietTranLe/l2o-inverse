@@ -806,6 +806,7 @@ def load_model_from_conf(bsl, baseline_conf):
 import yaml
 def plot_source_estimate(src, t_max, fwd, surfer_view="lateral", fs=512, threshold=0.2):    
     surfer_params_file = "params_surfer.yaml"
+    surfer_params_file = Path(Path(__file__).resolve().parent, surfer_params_file)
     with open(surfer_params_file, "r") as f:
         surfer_kwargs = yaml.safe_load(f)
 

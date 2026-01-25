@@ -1,0 +1,4 @@
+_target_ : models.update_rule.prox_MM_l1_UR
+lambda_l1: 1e-2
+# mode: proj_Dl1ball
+mode: prox_l1

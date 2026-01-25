@@ -78,7 +78,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 output_dir = Path(ROOT, args.output_dir)
 config_path = Path(output_dir, ".hydra")
-print(f"Config path: {config_path}")
+print(config_path)
 #overrides_name = Path("overrides.yaml")
 ## load the overrides file
 #overr = OmegaConf.load(Path(config_path, overrides_name))
@@ -320,18 +320,23 @@ for k in tqdm(range(n_val_samples)):
                 input= eeg_gt.float().unsqueeze(0).clone(), 
                 tgt= src_gt.float().unsqueeze(0).clone()) 
 
+            try:
+                if litmodel.l2o.update_rule.mode == "proj_Dl1ball":
+                    c = torch.norm(batch.tgt.view(-1), p=1).item()
+                    litmodel.l2o.update_rule.lambda_l1 = 1.5*c
+            except AttributeError:
+                pass
+
             with torch.no_grad():
                 if args.time_window: 
                     windows_input = signal_to_windows(batch.input, window_length=window_length, overlap=overlap, pad=True) 
                     windows_tgt = signal_to_windows(batch.tgt, window_length=window_length, overlap=overlap, pad=True) 
                     windows = TrainingItem(input=windows_input.squeeze(), tgt=windows_tgt.squeeze())
-                    output = litmodel(windows)
+                    output, inner_losses, full_terms = litmodel.l2o(windows_tgt, windows_input, return_all=True)
                     # output = torch.matmul(litmodel(windows), windows.input)
                     # output = windows.tgt
-                    output_ae = litmodel.solver.prior_cost.forward_ae( litmodel(windows) ) # check the output of the prior model
-                    # output_ae = torch.matmul(litmodel.solver.prior_cost.forward_ae( litmodel(windows)), windows.input)
-                    print(output_ae.shape)
-                    
+                    output_ae = litmodel.l2o.reg_net(output)
+                    # output_ae = torch.matmul(litmodel.solver.prior_cost.forward_ae( litmodel(windows)), windows.input)                    
                     output = torch.from_numpy( windows_to_signal(output.unsqueeze(1), overlap=overlap, n_times=batch.input.shape[-1]) )
                     output_ae = torch.from_numpy( windows_to_signal(output_ae.unsqueeze(1), overlap=overlap, n_times=batch.input.shape[-1]) )
                 else:

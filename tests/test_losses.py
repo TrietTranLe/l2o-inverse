@@ -82,7 +82,7 @@ def test_external_vars():
     x = torch.randn(4, 10)
     y = torch.randn(4, 10)
 
-    total, terms = loss(x=x, y=y, return_terms=True)
+    total, terms, inters = loss(x=x, y=y, return_terms=True, return_intermediate=True)
     print("MSE + Cosine:", float(total))
     for k, v in terms.items():
         print(f"  {k}: {float(v)}")
