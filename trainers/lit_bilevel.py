@@ -81,6 +81,12 @@ class LitBiLevel(pl.LightningModule):
         except AttributeError:
             pass
 
+        try:
+            if self.l2o.update_rule.init_mode in ["pinv", "adjoint", "mne"]:
+                self.l2o.update_rule.compute_lambda(y, self.l2o.inner_loss.L)
+        except AttributeError:
+            pass 
+
         # ---- Inner optimization ----
         x_inner, inner_losses, _ = self.l2o(x, y, steps=self.inner_steps, return_all=True)
 
@@ -111,6 +117,12 @@ class LitBiLevel(pl.LightningModule):
                 self.l2o.update_rule.lambda_l1 = 1.5*c
         except AttributeError:
             pass
+
+        try:
+            if self.l2o.update_rule.init_mode in ["pinv", "adjoint", "mne"]:
+                self.l2o.update_rule.compute_lambda(y, self.l2o.inner_loss.L)
+        except AttributeError:
+            pass 
 
         with torch.no_grad():
             x_inner = self.l2o(x, y, steps=self.inner_steps)

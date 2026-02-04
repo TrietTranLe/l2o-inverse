@@ -180,10 +180,11 @@ class prox_MM_l1_UR(BaseUR):
         """
         grad, P = grad  # grad is a tuple (grad, P)
         MM_step = x - grad
+        lambda_l1 = self._get_lambda_l1(x, P, step)
         if self.mode == "prox_l1":
-            return self.prox_l1(MM_step, P, self.lambda_l1)
+            return self.prox_l1(MM_step, P, lambda_l1)
         elif self.mode == "proj_Dl1ball":
-            return self.proj_Dl1ball(MM_step, P, self.lambda_l1)
+            return self.proj_Dl1ball(MM_step, P, lambda_l1)
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
@@ -212,7 +213,7 @@ class prox_MM_l1_UR(BaseUR):
         magnitude = torch.clamp(torch.abs(z) - thresholds, min=0.0)
         return sign_z * magnitude
 
-    def proj_Dl1ball (self, z, P, lambda_l1):
+    def proj_Dl1ball(self, z, P, lambda_l1):
         """
         Projection onto the weighted l1 ball defined by:
             C = {z : ||z||_1 <= lambda_l1} with weights P (diagonal of majorant)
@@ -253,3 +254,420 @@ class prox_MM_l1_UR(BaseUR):
             tau = 0.0 # Fallback
 
         return (torch.sign(z) * torch.clamp(torch.abs(z) - tau*P_flat, min=0.0)).view(original_shape)
+
+
+class prox_MM_l1_SFAttention_UR(prox_MM_l1_UR):
+    """
+    prox_MM_l1_UR with a self-factorized attention network to predict lambda_l1 from physical information (y, L).
+    Inherits from prox_MM_l1_UR.
+    """
+    def __init__(self, dim_hidden=8, mode: str="proj_Dl1ball", init_mode: str ="pinv"):
+        super().__init__(mode=mode)
+        
+        self.init_mode = init_mode  # "pinv", "adjoint", "mne"
+        self.dim_hidden = dim_hidden
+
+        # Spatial
+        # Input: Average over time -> (B, S, 1)
+        self.spatial_net = nn.Sequential(
+            nn.Conv1d(1, self.dim_hidden, 1, padding="same"),
+            nn.ReLU(),
+            # nn.Conv1d(self.dim_hidden, self.dim_hidden, 3, padding="same"),
+            nn.Conv1d(self.dim_hidden, self.dim_hidden, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden, self.dim_hidden, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden, 1, 1, padding="same"),
+            nn.Sigmoid()
+        )
+        
+        # Temporal
+        # Input: Average over sources -> (B, 1, T)
+        self.temporal_net = nn.Sequential(
+            nn.Conv1d(1, self.dim_hidden, 1, padding="same"),
+            nn.ReLU(),
+            #nn.Conv1d(self.dim_hidden, self.dim_hidden, 3, padding="same"),
+            nn.Conv1d(self.dim_hidden, self.dim_hidden, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden, self.dim_hidden, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden, 1, 1, padding="same"),
+            nn.Sigmoid()
+        )
+
+    def compute_lambda(self, y, L):
+        x_init = self._init_x(y, L) # (B, S, T)
+        
+        # Spatial Map
+        x_energy_space = torch.mean(torch.abs(x_init), dim=2, keepdim=True) # (B, S, 1)
+        spatial_map = self.spatial_net(x_energy_space.permute(0, 2, 1)).permute(0, 2, 1) # (B, S, 1)
+        
+        # Temporal Map
+        x_energy_time = torch.mean(torch.abs(x_init), dim=1, keepdim=True) # (B, 1, T)
+        temporal_map = self.temporal_net(x_energy_time) # (B, 1, T)
+        
+        # Broadcast multiplication
+        # (B, S, 1) * (B, 1, T) -> (B, S, T)
+        self.lambda_matrix = spatial_map @ temporal_map
+
+    def _get_lambda_l1(self, x, P, step, eps: float = 1e-8):
+        max_x = torch.max(torch.abs(x).flatten(start_dim=1), dim=1)[0]
+        return self.lambda_matrix * max_x.unsqueeze(1).unsqueeze(1)  # max(|x|)
+
+    def _init_x(self, y, L):
+        if self.init_mode == "pinv":
+            return torch.linalg.pinv(L) @ y
+        elif self.init_mode == "adjoint":
+            return L.T @ y
+        elif self.init_mode == "mne":
+            SNR = 3.0 # assumed SNR
+            LLt = L @ L.t()
+            lambda_reg = torch.trace(LLt) / (L.shape[0] * (SNR ** 2))
+            inv_term = torch.linalg.inv(LLt + lambda_reg * torch.eye(L.shape[0], device=L.device))
+            return L.t() @ inv_term @ y
+        else:
+            raise ValueError(f"Invalid init mode: {self.init_mode}")
+
+
+class prox_MM_l1_FGatHisEmb_UR(prox_MM_l1_UR):
+    """
+    prox_MM_l1_UR with:
+        a self-factorized attention network to estimate threshold mask from physical information (y, L)
+        a linear network to compute threshold amplitude from statistical values of |z| and P.
+    Inherits from prox_MM_l1_UR.
+    """
+    def __init__(self, dim_hidden_gate=8, dim_hidden_alpha=64, mode: str="proj_Dl1ball", init_mode: str ="pinv"):
+        super().__init__(mode=mode)
+        
+        self.init_mode = init_mode  # "pinv", "adjoint", "mne"
+        self.dim_hidden_gate = dim_hidden_gate
+        self.dim_hidden_alpha = dim_hidden_alpha
+        self.dim_history = 10
+        self.alpha_net = nn.Sequential(
+            nn.Linear(9 + self.dim_history, self.dim_hidden_alpha),
+            nn.ReLU(),
+            nn.Linear(self.dim_hidden_alpha, self.dim_hidden_alpha),
+            nn.ReLU(),
+            nn.Linear(self.dim_hidden_alpha, 1),
+            nn.Sigmoid()
+        )
+
+        # Spatial
+        # Input: Average over time -> (B, S, 1)
+        self.spatial_net = nn.Sequential(
+            nn.Conv1d(1, self.dim_hidden_gate, 1, padding="same"),
+            nn.ReLU(),
+            # nn.Conv1d(self.dim_hidden_gate, self.dim_hidden_gate, 3, padding="same"),
+            nn.Conv1d(self.dim_hidden_gate, self.dim_hidden_gate, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden_gate, self.dim_hidden_gate, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden_gate, 1, 1, padding="same"),
+            nn.Sigmoid()
+        )
+        
+        # Temporal
+        # Input: Average over sources -> (B, 1, T)
+        self.temporal_net = nn.Sequential(
+            nn.Conv1d(1, self.dim_hidden_gate, 1, padding="same"),
+            nn.ReLU(),
+            #nn.Conv1d(self.dim_hidden_gate, self.dim_hidden_gate, 3, padding="same"),
+            nn.Conv1d(self.dim_hidden_gate, self.dim_hidden_gate, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden_gate, self.dim_hidden_gate, kernel_size=5, padding="same"),
+            nn.ReLU(),
+            nn.Conv1d(self.dim_hidden_gate, 1, 1, padding="same"),
+            nn.Sigmoid()
+        )
+
+    def compute_lambda(self, y, L):
+        x_init = self._init_x(y, L) # (B, S, T)
+        
+        # Spatial Map
+        x_energy_space = torch.mean(torch.abs(x_init), dim=2, keepdim=True) # (B, S, 1)
+        spatial_map = self.spatial_net(x_energy_space.permute(0, 2, 1)).permute(0, 2, 1) # (B, S, 1)
+        
+        # Temporal Map
+        x_energy_time = torch.mean(torch.abs(x_init), dim=1, keepdim=True) # (B, 1, T)
+        temporal_map = self.temporal_net(x_energy_time) # (B, 1, T)
+        
+        # Broadcast multiplication
+        # (B, S, 1) * (B, 1, T) -> (B, S, T)
+        self.lambda_mask = spatial_map @ temporal_map
+
+    def _get_lambda_l1(self, x, P, step, eps: float = 1e-8):
+        if step == 0:
+            self._reset_state(x)
+
+        # Compute features
+        x_abs = torch.abs(x)
+        x_norm = x_abs/(P + eps)
+        features = torch.stack([s for tensor in (x_abs, P, x_norm) for s in self._get_statistic_feature(tensor)]).T  # Shape (batch, 9)
+
+        # Predict alpha
+        alpha = self.alpha_net(torch.cat([features, self._history], dim=1))
+
+        # Update history
+        self._history = torch.cat([alpha, self._history[:, :-1]], dim=1)
+
+        # Scale to get lambda_l1
+        return  alpha.unsqueeze(1) * self.lambda_mask * features[:, 2].unsqueeze(1).unsqueeze(1)  # max(|x|)
+
+    def _init_x(self, y, L):
+        if self.init_mode == "pinv":
+            return torch.linalg.pinv(L) @ y
+        elif self.init_mode == "adjoint":
+            return L.T @ y
+        elif self.init_mode == "mne":
+            SNR = 3.0 # assumed SNR
+            LLt = L @ L.t()
+            lambda_reg = torch.trace(LLt) / (L.shape[0] * (SNR ** 2))
+            inv_term = torch.linalg.inv(LLt + lambda_reg * torch.eye(L.shape[0], device=L.device))
+            return L.t() @ inv_term @ y
+        else:
+            raise ValueError(f"Invalid init mode: {self.init_mode}")
+    
+    def _get_statistic_feature(self, tensor):
+        flat_tensor = tensor.flatten(start_dim=1)
+        return [torch.mean(flat_tensor, dim=1), torch.std(flat_tensor, dim=1), torch.max(flat_tensor, dim=1)[0]]
+
+    def _reset_state(self, inp):
+        size = [inp.shape[0], self.dim_history]
+        self._history = torch.full(size, -1.0, device=inp.device)
+
+
+class prox_MM_l1_LLambda_UR(prox_MM_l1_UR):
+    """
+    prox_MM_l1_UR with a trainable lambda_l1.
+    Inherits from prox_MM_l1_UR.
+    """
+    def __init__(self, init_lambda=1e-4, mode="proj_Dl1ball"):
+        super().__init__(mode=mode)
+        import math
+        init_log_w = math.log(init_lambda)
+        self.log_w = nn.Parameter(torch.tensor(float(init_log_w)))
+
+    def _get_lambda_l1(self, x, P, step, eps: float = 1e-8):
+        return torch.exp(self.log_w)
+
+
+class prox_MM_l1_Linear_UR(prox_MM_l1_UR):
+    """
+    prox_MM_l1_UR with a Linear network to predict lambda_l1 at each step.
+    Inherits from prox_MM_l1_UR.
+    """
+    def __init__(self, dim_hidden=64, mode="proj_Dl1ball"):
+        super().__init__(mode=mode)
+        
+        self.dim_hidden = dim_hidden
+        # NN to predict alpha
+        self.alpha_net = nn.Sequential(
+            nn.Linear(9, self.dim_hidden),
+            nn.ReLU(),
+            nn.Linear(self.dim_hidden, self.dim_hidden),
+            nn.ReLU(),
+            nn.Linear(self.dim_hidden, 1),
+            nn.Sigmoid()
+        )
+
+    def _get_lambda_l1(self, x, P, step, eps: float = 1e-8):
+        """ Predict lambda_l1 using alpha_net based on features from (x, P) """
+        x_abs = torch.abs(x)
+        x_norm = x_abs/(P + eps)
+        features = torch.stack([s for tensor in (x_abs, P, x_norm) for s in self._get_statistic_feature(tensor)]).T  # Shape (batch, 9)
+
+        # Predict alpha
+        alpha = self.alpha_net(features).unsqueeze(1)  # Shape (batch, 1, 1)
+
+        # Scale to get lambda_l1
+        return  alpha * features[:, 2].unsqueeze(1).unsqueeze(1)  # max(|x|)
+
+    def _get_statistic_feature(self, tensor):
+        flat_tensor = tensor.flatten(start_dim=1)
+        return [torch.mean(flat_tensor, dim=1), torch.std(flat_tensor, dim=1), torch.max(flat_tensor, dim=1)[0]]
+
+
+class prox_MM_l1_Linear_HisEmb_UR(prox_MM_l1_UR):
+    """
+    prox_MM_l1_UR with a Linear network to predict lambda_l1 at each step.
+    Inherits from prox_MM_l1_UR.
+    """
+    def __init__(self, dim_hidden=48, mode="proj_Dl1ball", downsamp=None):
+        super().__init__(mode=mode)
+
+        self.dim_hidden = dim_hidden
+        self.dim_history = 10
+        self.alpha_net = nn.Sequential(
+            nn.Linear(9 + self.dim_history, self.dim_hidden),
+            nn.ReLU(),
+            nn.Linear(self.dim_hidden, self.dim_hidden),
+            nn.ReLU(),
+            nn.Linear(self.dim_hidden, 1),
+            nn.Sigmoid()
+        )
+
+    def reset_state(self, inp):
+        size = [inp.shape[0], self.dim_history]
+        self._history = torch.full(size, -1.0, device=inp.device)
+
+    def _forward(self, features):
+        features = self.alpha_net(features)
+        return features
+
+    def _get_lambda_l1(self, x, P, step, eps: float = 1e-8):
+        """ Predict lambda_l1 using alpha_net based on features from (x, P) """
+        # Compute features
+        if step == 0:
+            self.reset_state(x)
+
+        x_abs = torch.abs(x)
+        x_norm = x_abs/(P + eps)
+        features = torch.stack([s for tensor in (x_abs, P, x_norm) for s in self._get_statistic_feature(tensor)]).T  # Shape (batch, 9)
+
+        # Predict alpha
+        alpha = self._forward(torch.cat([features, self._history], dim=1))
+
+        # Update history
+        self._history = torch.cat([alpha, self._history[:, :-1]], dim=1)
+
+        # Scale to get lambda_l1
+        return alpha.unsqueeze(1) * torch.max(x_abs)  # max(|x|)
+
+    def _get_statistic_feature(self, tensor):
+        flat_tensor = tensor.flatten(start_dim=1)
+        return [torch.mean(flat_tensor, dim=1), torch.std(flat_tensor, dim=1), torch.max(flat_tensor, dim=1)[0]]
+
+
+class prox_MM_l1_LinearLSTM_UR(prox_MM_l1_UR):
+    """
+    prox_MM_l1_UR with a LinearLSTM network to predict lambda_l1 at each step.
+    Inherits from prox_MM_l1_UR.
+    """
+    def __init__(self, dim_hidden=48, mode="proj_Dl1ball", downsamp=None):
+        super().__init__(mode=mode)
+
+        self.dim_hidden = dim_hidden
+        self._state = []
+
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(9, dim_hidden),
+            nn.ReLU(),
+        )
+
+        self.alpha_decoder = nn.Sequential(
+            nn.Linear(dim_hidden, 1),
+            nn.Sigmoid()
+        )
+        self.gates = nn.Linear(2*dim_hidden, 4 * dim_hidden)
+
+    def reset_state(self, inp):
+        size = [inp.shape[0], self.dim_hidden]
+        self._state = [
+            torch.zeros(size, device=inp.device),
+            torch.zeros(size, device=inp.device),
+        ]
+
+    def _forward(self, features):        
+        features = self.alpha_decoder(self._forward_LSTM(self.feature_encoder(features)))
+        return features
+
+    def _forward_LSTM(self, features):
+        hidden, cell = self._state
+        gates = self.gates(torch.cat((features, hidden), 1))
+        in_gate, remember_gate, out_gate, cell_gate = gates.chunk(4, 1)
+        in_gate, remember_gate, out_gate = map(
+            torch.sigmoid, [in_gate, remember_gate, out_gate]
+        )
+        cell_gate = torch.tanh(cell_gate)
+        cell = (remember_gate * cell) + (in_gate * cell_gate)
+        hidden = out_gate * torch.tanh(cell)
+
+        self._state = hidden, cell
+        return hidden
+
+    def _get_lambda_l1(self, x, P, step, eps: float = 1e-8):
+        """ Predict lambda_l1 using alpha_net based on features from (x, P) """
+        # Compute features
+        if step == 0:
+            self.reset_state(x)
+
+        x_abs = torch.abs(x)
+        x_norm = x_abs/(P + eps)
+        features = torch.stack([s for tensor in (x_abs, P, x_norm) for s in self._get_statistic_feature(tensor)]).T  # Shape (batch, 9)
+
+        # Predict alpha
+        alpha = self._forward(features).unsqueeze(1)  # Shape (batch, 1, 1)
+
+        # Scale to get lambda_l1
+        return  alpha * features[:, 2].unsqueeze(1).unsqueeze(1)  # max(|x|)
+
+    def _get_statistic_feature(self, tensor):
+        flat_tensor = tensor.flatten(start_dim=1)
+        return [torch.mean(flat_tensor, dim=1), torch.std(flat_tensor, dim=1), torch.max(flat_tensor, dim=1)[0]]
+
+
+class prox_MM_l1_LinearGRU_UR(prox_MM_l1_UR):
+    """
+    prox_MM_l1_UR with a LinearLSTM network to predict lambda_l1 at each step.
+    Inherits from prox_MM_l1_UR.
+    """
+    def __init__(self, dim_hidden=48, mode="proj_Dl1ball", downsamp=None):
+        super().__init__(mode=mode)
+
+        self.dim_hidden = dim_hidden
+        self._state = []
+
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(9, dim_hidden),
+            nn.ReLU(),
+        )
+
+        self.alpha_decoder = nn.Sequential(
+            nn.Linear(dim_hidden, 1),
+            nn.Sigmoid()
+        )
+        self.gates = nn.Linear(2*dim_hidden, 2*dim_hidden)
+        self.new_linear = nn.Linear(2*dim_hidden, dim_hidden)
+
+
+    def reset_state(self, inp):
+        size = [inp.shape[0], self.dim_hidden]
+        self._state = torch.zeros(size, device=inp.device)
+
+    def _forward(self, features):        
+        features = self.alpha_decoder(self._forward_LSTM(self.feature_encoder(features)))
+        return features
+
+    def _forward_LSTM(self, features):
+        hidden = self._state
+
+        gates = self.gates(torch.cat((features, hidden), 1))
+        update_gate, reset_gate = gates.chunk(2, 1)
+        update_gate, reset_gate = map(
+            torch.sigmoid, [update_gate, reset_gate]
+        )
+        new_gate = torch.tanh(self.new_linear(torch.cat((features, reset_gate * hidden), 1)))
+        hidden = (1 - update_gate) * hidden + update_gate * new_gate
+
+        self._state = hidden
+        return hidden
+
+    def _get_lambda_l1(self, x, P, step, eps: float = 1e-8):
+        """ Predict lambda_l1 using alpha_net based on features from (x, P) """
+        # Compute features
+        if step == 0:
+            self.reset_state(x)
+
+        x_abs = torch.abs(x)
+        x_norm = x_abs/(P + eps)
+        features = torch.stack([s for tensor in (x_abs, P, x_norm) for s in self._get_statistic_feature(tensor)]).T  # Shape (batch, 9)
+
+        # Predict alpha
+        alpha = self._forward(features).unsqueeze(1)  # Shape (batch, 1, 1)
+
+        # Scale to get lambda_l1
+        return  alpha * features[:, 2].unsqueeze(1).unsqueeze(1)  # max(|x|)
+
+    def _get_statistic_feature(self, tensor):
+        flat_tensor = tensor.flatten(start_dim=1)
+        return [torch.mean(flat_tensor, dim=1), torch.std(flat_tensor, dim=1), torch.max(flat_tensor, dim=1)[0]]

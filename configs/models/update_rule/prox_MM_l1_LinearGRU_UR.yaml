@@ -1,0 +1,4 @@
+_target_ : models.update_rule.prox_MM_l1_LinearGRU_UR
+dim_hidden: 48
+# mode: proj_Dl1ball
+mode: prox_l1

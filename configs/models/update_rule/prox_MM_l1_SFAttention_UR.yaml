@@ -1,0 +1,5 @@
+_target_ : models.update_rule.prox_MM_l1_SFAttention_UR
+dim_hidden: 8
+# mode: proj_Dl1ball
+mode: prox_l1
+init_mode: mne

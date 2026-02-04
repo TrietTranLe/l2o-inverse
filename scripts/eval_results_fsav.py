@@ -327,6 +327,12 @@ for k in tqdm(range(n_val_samples)):
             except AttributeError:
                 pass
 
+            try:
+                if litmodel.l2o.update_rule.init_mode in ["pinv", "adjoint", "mne"]:
+                    litmodel.l2o.update_rule.compute_lambda(batch.input, litmodel.l2o.inner_loss.L)
+            except AttributeError:
+                pass
+
             with torch.no_grad():
                 if args.time_window: 
                     windows_input = signal_to_windows(batch.input, window_length=window_length, overlap=overlap, pad=True) 
@@ -362,7 +368,7 @@ for k in tqdm(range(n_val_samples)):
         ## check for overlap ------ @TODO : fix ok for 2 sources, not for more
         seeds = dm.test_ds.md[k]["seeds"]
         if type(seeds) is int:
-            seeds = [seeds]
+            seeds = []
 
         patches = [ [] for _ in range(len(seeds)) ]
         for kk in range(len(seeds)) : 

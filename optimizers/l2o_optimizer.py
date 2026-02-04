@@ -73,16 +73,17 @@ class EsiGradSolver(nn.Module):
                 if self.bound_estimating_steps is not None:
                     if self.bound_estimating_steps == 0:
                         from collections import deque
-                        result = []
+                        flatten_dict = {}
                         queue = deque([(None, intermediate)]) # (parent_key, current_dict)
                         while queue:
                             parent, current = queue.popleft()
                             for k, v in current.items():
                                 full_key = f"{parent}.{k}" if parent else k
-                                result.append(full_key)
                                 if isinstance(v, dict):
                                     queue.append((full_key, v))
-                        print(result)
+                                else:
+                                    flatten_dict[full_key] = v
+                        print(flatten_dict.keys())
                         print(1/"r")
                         bounds = self.compute_bounds(intermediate, state, grad)
                     else:
@@ -102,81 +103,68 @@ class EsiGradSolver(nn.Module):
 
             return (state, inner_losses, full_terms) if return_all else state
 
-    def compute_mu1_mu2(loss_intermediate, eps: float = 1e-8):
+    def compute_bound_analytical(self, loss_intermediate, lambda_val: float = 1.0, eps_softrelu: float = 0.1, eps_div: float = 1e-8):
         """
-        Compute mu1 and mu2 used in convergence analysis.
+        Compute the upper and lower bounds for p(x) using analytical bounds 
+        for the Jacobian (rho) and Hessian (alpha), instead of autograd.
 
-        Mathematical definitions
-        -------------------------
-        mu1 = 5 * ||L||^2 / ||L x||^2
-
-        mu2 = (1/(beta ||x||)) * (5*rho + 1)
-            + (2*alpha*sqrt(s))/beta
-            + 4 * (rho/beta + 1/||x||)^2
-
-        where
-        rho   = ||∇_x Phi(x;theta)||
-        alpha = max_i ||∇_x^2 [Phi(x;theta)]_i||
-        beta  = ||Phi(x;theta)||
+        Mathematical bounds:
+            Upper Bound = 1 / (mu1 + lambda * mu2) * 1
+            Lower Bound = eps
 
         Args:
-            L: Linear operator or matrix used in mu1.
-            x: Input vector.
-            Phi_x: Value of Phi(x; theta).
-            grad_Phi_x: Gradient of Phi w.r.t. x, with
-                        grad_Phi_x[i] = ∇_x [Phi(x; theta)]_i.
-            hess_Phi_x: Hessian of Phi w.r.t. x, with
-                        hess_Phi_x[i] = ∇_x^2 [Phi(x; theta)]_i.
-            eps: Small constant to avoid division by zero.
-
+            loss_intermediate (dict): Input data dictionary.
+                                    Keys required: 'input.L', 'input.x', 'data.L@x', 'reg.AE(x)'
+            lambda_val (float): Regularization coefficient lambda.
+            eps_softrelu (float): Epsilon used in SoftReLU activation (for alpha calculation).
+            eps_div (float): Small constant to avoid division by zero.
+        
         Returns:
-            mu1: Scalar value 5 * ||L||^2 / ||L x||^2.
-            mu2: Scalar value defined using rho, alpha, beta.
+            lower_bound (Tensor): Tensor of size x (approx 0).
+            upper_bound (Tensor): Tensor of size x containing the upper bound values.
         """
-        L, x, Phi_x, grad_Phi_x, hess_Phi_x = loss_intermediate
+        L = loss_intermediate['input.L']
+        x = loss_intermediate['input.x']
+        Lx = loss_intermediate['data.L@x']      # Pre-computed L*x
+        Phi_x = loss_intermediate['reg.AE(x)']  # Pre-computed Phi(x)
+        
+        s = Phi_x.numel() # Dimension of the output vector s
+        
+        # Basic Norms
+        x_norm = torch.norm(x)
+        beta = torch.norm(Phi_x)      # beta = ||Phi(x)||
+        Lx_norm = torch.norm(Lx)
+        L_op = torch.norm(L) 
 
-
-        s = Phi_x.shape[0]
-
-        # norms of x and Phi
-        x_norm = np.linalg.norm(x, 2)
-        beta = np.linalg.norm(Phi_x, 2)
-
-        # operator norm of L
-        L_op = np.linalg.norm(L, 2)
-
-        # ||Lx||
-        Lx = L @ x
-        Lx_norm = np.linalg.norm(Lx, 2)
-
-        # rho = ||∇_x Phi|| (Frobenius norm of Jacobian)
-        # If you need operator norm instead, replace 'fro' by 2
-        rho = np.linalg.norm(grad_Phi_x, 'fro')
-
-        # alpha = max_i ||H_i||
-        alpha = 0.0
-        for i in range(s):
-            Hi = hess_Phi_x[i]
-            alpha = max(alpha, np.linalg.norm(Hi, 2))
-
-        # safeguards
-        beta_safe = max(beta, eps)
-        x_norm_safe = max(x_norm, eps)
-        Lx_norm_safe = max(Lx_norm, eps)
-
-        # mu1
+        # Compute RHO and ALPHA analytically
+        rho = compute_rho_analytical(ae_layers)
+        alpha = compute_alpha_analytical(ae_layers, epsilon=eps_softrelu)
+        
+        # Safeguards to prevent division by zero
+        beta_safe = max(beta, eps_div)
+        x_norm_safe = max(x_norm, eps_div)
+        Lx_norm_safe = max(Lx_norm, eps_div)
+        
+        # mu1 = 5 * ||L||^2 / ||Lx||^2
         mu1 = 5.0 * (L_op ** 2) / (Lx_norm_safe ** 2)
 
-        # mu2
-        mu2 = (
-            (1.0 / (beta_safe * x_norm_safe)) * (5.0 * rho + 1.0)
-            + (2.0 * alpha * np.sqrt(s)) / beta_safe
-            + 4.0 * ((rho / beta_safe) + (1.0 / x_norm_safe)) ** 2
-        )
+        # mu2 = (1/(beta*||x||)) * (5*rho + 1) 
+        #       + (2*alpha*sqrt(s))/beta 
+        #       + 4 * (rho/beta + 1/||x||)^2
+        mu2 = (1.0 / (beta_safe * x_norm_safe)) * (5.0 * rho + 1.0) + \
+              (2.0 * alpha * np.sqrt(s)) / beta_safe + \
+              4.0 * ((rho / beta_safe) + (1.0 / x_norm_safe)) ** 2
 
-        bound_max = 1/(mu1 + mu2)
-        bound_min = torch.full_like(bound_max, eps)
-        return bound_min, bound_max
+        # Upper bound = 1 / (mu1 + lambda * mu2)
+        val_upper = 1.999 / (mu1 + lambda_val * mu2 + eps_div)
+        
+        # Expand scalar result to tensor matching x's shape
+        upper_bound = torch.full_like(x, val_upper.item())
+        
+        # Lower bound (nu > 0, approximated by eps)
+        lower_bound = torch.full_like(x, eps_div)
+
+        return lower_bound, upper_bound
 
 
     def estimate_bounds(self, loss, state: torch.Tensor, grad: torch.Tensor | None = None, steps: int = 3, safety: float = 1.0, eps: float = 1e-8):
