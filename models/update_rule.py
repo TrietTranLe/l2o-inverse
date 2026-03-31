@@ -188,6 +188,10 @@ class prox_MM_l1_UR(BaseUR):
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
+    def _get_lambda_l1(self, x, P, step):
+        """ Get lambda_l1 for this step. Can be overridden by child classes for dynamic lambda. """
+        return self.lambda_l1
+
     def prox_l1(self, z, P, lambda_l1):
         """
         Executes the Proximal MM step for L1 Regularization (Lasso) using a diagonal majorant.
@@ -671,3 +675,58 @@ class prox_MM_l1_LinearGRU_UR(prox_MM_l1_UR):
     def _get_statistic_feature(self, tensor):
         flat_tensor = tensor.flatten(start_dim=1)
         return [torch.mean(flat_tensor, dim=1), torch.std(flat_tensor, dim=1), torch.max(flat_tensor, dim=1)[0]]
+
+
+class S_MM_UR(BaseUR):
+    """
+    A stochastic-majorization-minimization (MM) update rule.
+    """
+    def __init__(self, temperature: float = 1.0, D_iterations: int = 3):
+        super().__init__()
+        self.temperature = temperature
+        self.D_iterations = D_iterations
+        self.snr_target = 1.0
+
+    def forward(self, x, grad, step):
+        """
+        Args:
+            x    : current state (Tensor)
+            grad : tuple (P_grad, P, grad) from grad_mod
+            P    : diagonal majorant matrix (Tensor, same shape as x)
+            step : int, step index
+        """
+        P_grad, P, grad = grad  # grad is a tuple (P_grad, P, grad)
+        if self.temperature != 0.0:
+            D = self._compute_D(P, grad, step)
+            D_hat = torch.mean(P_grad**2)/(2*self.temperature*self.snr_target)*D
+            noise = torch.sqrt(2*self.temperature*D_hat) * torch.randn_like(x)
+
+            if step == 0:
+                self.snr = 0.0
+            elif step < 10 - 1:
+                self.snr += torch.norm(P_grad) / (torch.norm(noise) + 1e-8)
+            else:
+                self.snr /= 10
+                print(f"[Step: {step}] Average SNR of updates: {self.snr:.6f}")
+            # print(f"[Step: {step}] norm mean: {torch.norm(P_grad):.6f}")
+            # print(f"[Step: {step}] norm noise: {torch.norm(noise):.6f}")
+            # print(f"[Step: {step}] mean d: {D.mean():.6f}")
+            # print(f"[Step: {step}] max d: {D.max():.6f}")
+            # print(f"[Step: {step}] mean p: {P.mean():.6f}")
+            # print(f"[Step: {step}] max p: {P.max():.6f}")
+
+            return x - P_grad + noise  # Add noise to MM step
+        else:
+            return x - P_grad
+
+    def _compute_D(self, P, grad, step):
+        """ Compute a diagonal matrix D based on P, grad, and step."""
+        P_norm = P/(P.mean(dim=tuple(range(1, P.ndim)), keepdim=True))
+        if step == 0:
+            self.D = P_norm.detach()
+            return self.D
+        
+        alpha = (1.0 / self.temperature) * P * grad.pow(2)
+        self.D = P_norm + torch.exp(-alpha) * (self.D - P_norm)
+        # self.D = self.D - (1/self.temperature)*P*(self.D - P_norm)*grad**2
+        return torch.clamp(self.D, min=1e-8)

@@ -102,7 +102,7 @@ class x_grad_mod_mul(ConvLstmGradMod):
         # gradients[-1].append(grad_x.detach().to('cpu').squeeze().numpy())
         out = P*grad_x
         # gradients[-1].append(out.detach().to('cpu').squeeze().numpy())
-        return einops.rearrange(out, self.rearrange_aft), einops.rearrange(P, self.rearrange_aft)
+        return einops.rearrange(out, self.rearrange_aft), einops.rearrange(P, self.rearrange_aft), einops.rearrange(grad_x, self.rearrange_aft)
 
     def _clamp_P(self, P, P_min=None, P_max=None):
         """

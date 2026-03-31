@@ -131,6 +131,36 @@ class LitBiLevel(pl.LightningModule):
         self.log("val/outer_loss", val_loss, prog_bar=True, on_epoch=True)
         return val_loss
 
+
+    def on_train_epoch_start(self):
+        epoch = self.current_epoch
+
+        # Dynamic scheduling of update rule parameters (e.g., temperature) based on epoch
+        try:
+            if self.l2o.update_rule.temperature != 0.0 and not hasattr(self, "T_max"):
+                self.T_max = self.l2o.update_rule.temperature
+        except AttributeError:
+            pass
+    
+        if hasattr(self, "T_max"):
+            temp_start = 0.1
+            epoch_th_stage_list = [50, 250]
+
+            if epoch < epoch_th_stage_list[0]:
+                temperature = 0.0
+
+            elif epoch_th_stage_list[0] <= epoch < epoch_th_stage_list[1]:
+                progress = (epoch - epoch_th_stage_list[0]) / (epoch_th_stage_list[1] - epoch_th_stage_list[0])
+                temperature = self.T_max * (progress ** 2)
+                temperature = (temp_start + (1 - temp_start) * (progress ** 2)) * self.T_max
+            else:
+                temperature = self.T_max
+
+            self.l2o.update_rule.temperature = temperature
+            self.log("train/temperature", temperature, prog_bar=True, logger=True)
+            if epoch == 0 or (epoch_th_stage_list[0] <= epoch <= epoch_th_stage_list[1]):
+                print(f"[Epoch {epoch}] Update rule temperature set to: {temperature:.4f}")
+
     # -------------------------------------------------------------------------
     def configure_optimizers(self):
         """
