@@ -1,3 +1,3 @@
 _target_ : models.update_rule.S_MM_UR
 temperature: 0.5
-D_iterations: 3
+snr_target: 1.0

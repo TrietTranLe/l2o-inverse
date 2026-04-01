@@ -681,11 +681,10 @@ class S_MM_UR(BaseUR):
     """
     A stochastic-majorization-minimization (MM) update rule.
     """
-    def __init__(self, temperature: float = 1.0, D_iterations: int = 3):
+    def __init__(self, temperature: float = 1.0, snr_target: float = 1.0):
         super().__init__()
         self.temperature = temperature
-        self.D_iterations = D_iterations
-        self.snr_target = 1.0
+        self.snr_target = snr_target
 
     def forward(self, x, grad, step):
         """
@@ -729,4 +728,16 @@ class S_MM_UR(BaseUR):
         alpha = (1.0 / self.temperature) * P * grad.pow(2)
         self.D = P_norm + torch.exp(-alpha) * (self.D - P_norm)
         # self.D = self.D - (1/self.temperature)*P*(self.D - P_norm)*grad**2
+        return torch.clamp(self.D, min=1e-8)
+
+    def _compute_D_trapezoidal(self, E, x, mu, step, init_D=1e-8):
+        """ Compute a diagonal matrix D based on P, grad, and step."""
+        with torch.no_grad():
+            if step == 0:
+                self.D = torch.full_like(x, fill_value=init_D)
+                return self.D
+            
+            delta_E = E - self.E
+            delta_x = x - self.x
+            self.D = (self.D + delta_x*self.mu/self.temperature)*torch.exp(delta_E/self.temperature) + delta_x*mu/(2*self.temperature)
         return torch.clamp(self.D, min=1e-8)
