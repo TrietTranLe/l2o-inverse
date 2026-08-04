@@ -2,7 +2,7 @@ from collections import OrderedDict
 import torch
 from torch import nn
 from typing import Union, List, Tuple
-
+from torch.nn.utils import spectral_norm
 
 KernelSize = Union[int, List[int], Tuple[int, ...]]
 
@@ -56,7 +56,7 @@ class Conv1DAE(BaseAE):
         self.dim_in = dim_in
         self.dim_hidden = dim_hidden
         self.dim_out = dim_out
-        self.kernel_size = kernel_size
+        self.kernel_size = list(kernel_size) if not isinstance(kernel_size, int) else kernel_size
         self.bias = bias
         super().__init__(pretrained_model_path, fixed)
 
@@ -80,6 +80,56 @@ class Conv1DAE(BaseAE):
             ("conv_out", nn.Conv1d(in_channels=self.dim_hidden, out_channels=self.dim_out, kernel_size=self.kernel_size[2], bias=self.bias, padding="same"))
         ]))
 
+
+class NonexpansiveConv1DAE(BaseAE):
+    """
+    Conv1D Autoencoder used as a non-expansive regularizer inside L2O.
+
+    Attributes:
+        dim_in: Input dimension (number of input features).
+        dim_hidden: Dimension of the hidden layer(s).
+        dim_out: Output dimension (number of output features, typically equal to dim_in for reconstruction).
+        bias: Whether to use bias terms in the convolutional layers.
+        kernel_size: Size of the convolutional kernels (can be a single integer or a list of integers for different layers).
+    """
+    def __init__(self, dim_in: int = 1284, dim_hidden: int = 128, dim_out: int = 1284, kernel_size: KernelSize = 3, bias: bool = False, pretrained_model_path: str = None, fixed: bool = False):
+        self.dim_in = dim_in
+        self.dim_hidden = dim_hidden
+        self.dim_out = dim_out
+        self.kernel_size = kernel_size
+        self.bias = bias
+        super().__init__(pretrained_model_path, fixed)
+
+    def build_model(self):
+        # Normalize kernel_size
+        if isinstance(self.kernel_size, int):
+            self.kernel_size = [self.kernel_size] * 3
+        else:
+            try:
+                self.kernel_size = list(self.kernel_size)
+                assert len(self.kernel_size) == 3, "kernel_size list must have 3 values"
+            except:
+                raise TypeError(f"Invalid kernel_size type: {type(self.kernel_size)}")
+
+        self.encoder = nn.Sequential(OrderedDict([
+            ('conv_in', spectral_norm(nn.Conv1d(in_channels=self.dim_in, out_channels=self.dim_hidden, kernel_size=self.kernel_size[0], bias=self.bias, padding="same"))),
+            ('relu_in', nn.ReLU()),
+            ('conv_hidden', spectral_norm(nn.Conv1d(in_channels=self.dim_hidden, out_channels=self.dim_hidden, kernel_size=self.kernel_size[1], bias=self.bias, padding="same"))),
+            ('relu_hidden', nn.ReLU()),
+        ]))
+
+        self.decoder = nn.Sequential(OrderedDict([
+            ("conv_out", spectral_norm(nn.Conv1d(in_channels=self.dim_hidden, out_channels=self.dim_out, kernel_size=self.kernel_size[2], bias=self.bias, padding="same")))
+        ]))
+
+    # def forward(self, x: torch.Tensor, mode: str = "riemann") -> torch.Tensor:
+    #     """Forward pass through the autoencoder."""
+    #     # return self.decoder(self.encoder(x))
+    #     out = self.decoder(self.encoder(x))
+    #     if mode == "riemann":
+    #         return torch.nn.functional.normalize(out, p=2, dim=(-1, -2))
+    #     else:
+    #         return out
 
 class LConv1DAE(BaseAE):
     """

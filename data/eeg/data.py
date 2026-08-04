@@ -139,6 +139,8 @@ class EsiDataset(Dataset):
                self.datafolder, subject_name, orientation, electrode_montage ,source_sampling, "model"
         ) 
             self.leadfield = load_mat(Path(model_path, f"LF_{source_sampling}.mat"))['G']
+            # self.leadfield = load_mat(Path(model_path, f"LF_{source_sampling}_1:20.mat"))['G']
+
         if self.scaler_type == "linear_bis":
             self.alpha_lf = 10**(find_exp(self.leadfield.max()) + 1)
 

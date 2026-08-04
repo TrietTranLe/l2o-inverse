@@ -68,7 +68,6 @@ def load_mat(filename):
             return np.array(elem_list)
         else:
             return ndarray
-
     
     data = loadmat(filename, struct_as_record=False, squeeze_me=True)
     return _check_vars(data)
@@ -838,12 +837,21 @@ def plot_source_estimate(src, t_max, fwd, surfer_view="lateral", fs=512, thresho
 def plot_src_from_imgs(imgs,methods):
     from matplotlib.colors import LinearSegmentedColormap, Normalize
     ## plot # todo: enhance the way the colorbar is created to match any threshold value
-    # plt.rcParams["font.size"] = "28"
     
-    fig, axes = plt.subplots(figsize=(16, 5), nrows=1, ncols=len(imgs))
+    if len(methods) > 1:
+        figsize = (16, 5)
+    else:
+        figsize = (1.79, 1.79)
+        
+    fig, axes = plt.subplots(figsize=figsize, nrows=1, ncols=len(imgs), squeeze=False)
+    
     ii = 0
     cbar_axes = []
-    cbar_axes.append(fig.add_axes([0.85, 0.38, 0.01, 0.25]))
+    if len(methods) > 1:
+        cbar_axes.append(fig.add_axes([0.85, 0.38, 0.01, 0.25]))
+    else:
+        cbar_axes.append(fig.add_axes([0.9, 0.25, 0.05, 0.46]))
+
     col = plt.cm.Reds(np.linspace(0, 1, 128))
     col_ = [
         (0.0, "#d3d3d3"),
@@ -852,13 +860,12 @@ def plot_src_from_imgs(imgs,methods):
     col_ += list(zip(np.linspace(0.2, 1.0, 128), col))
     cmap = LinearSegmentedColormap.from_list("mycmap", col_)
 
-    ii = 0
-    for m in methods:
+    for ii, m in enumerate(methods):
         ax = axes.flat[ii]
-        _ = ax.imshow(imgs[m])
+        ax.imshow(imgs[m])
         ax.axis("off")
         ax.set_title(f"{m}")
-        ii += 1
+        
 
     fig.subplots_adjust(right=0.8)
     cb = fig.colorbar(
@@ -1086,11 +1093,11 @@ def load_fwd_fsav( datafolder:str, head_model_dict:dict, fwd_name:str, scaler_ty
         )
     fwd['sol']['data'] = leadfield
     if scaler_type == "linear_bis": 
-        print("NORMALIZATION LEADFIELD")
+        print(f"NORMALIZATION LEADFIELD ({scaler_type})")
         alpha_lf = 10**(find_exp(np.abs(fwd['sol']['data']).max()) + 1)
         fwd['sol']['data'] = fwd['sol']['data'] / alpha_lf
     elif scaler_type == "leadfield": 
-        print("NORMALIZATION LEADFIELD")
+        print(f"NORMALIZATION LEADFIELD ({scaler_type})")
         fwd['sol']['data'] = fwd['sol']['data'] / (10*np.max(fwd['sol']['data']))
     else : 
         pass
@@ -1101,7 +1108,12 @@ def build_leadfield_tensor(forward_obj):
     """
     Extracts forward matrix L from MNE forward object and converts to torch.Tensor.
     """
-    L = forward_obj['sol']['data']  # numpy array
+    if forward_obj is str:
+        # In case: leadfield conductivity is 0.33 0.0165 0.33 (1:20)
+        mat_data = loadmat(f'{forward_obj}/LF_fsav_994_1:20.mat')
+        L = mat_data['G']
+    else:
+        L = forward_obj['sol']['data']  # numpy array
     return torch.from_numpy(L).float()
 
 from math import log10, floor

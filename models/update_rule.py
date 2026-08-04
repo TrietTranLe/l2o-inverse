@@ -1,3 +1,5 @@
+from math import tau
+
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
@@ -49,6 +51,37 @@ class GradientDescentUR(BaseUR):
         if isinstance(grad, (list, tuple)):
             grad = grad[0]
         return x - grad
+    
+
+class MMFallbackingUR(BaseUR):
+    """
+    A fallbacking update rule that compares the MM-step and the learned-step and chooses the one with lower estimated upper bound on the loss.
+    Update rule:
+        x_learned = x - P_grad
+        x_GD = x - MM_upper_bound * grad
+        If U(x_learned) <= U(x_GD): return x_learned
+    """
+
+    def __init__(self, early_stopping_rate: float = None):
+        super().__init__()
+        self.early_stopping_rate = early_stopping_rate
+
+    def forward(self, x, grad, MM_upper_bound, step):
+        """
+        Args:
+            x    : current state (Tensor)
+            grad : output from grad_mod (Tensor, same shape as x)
+            step  : int, step index
+        """
+        if isinstance(grad, (list, tuple)):
+            P_grad, P, grad = grad
+        
+        delta_U = - torch.sum(P* grad.detach()**2) + 1/2 * torch.sum(P**2 * MM_upper_bound.detach() * grad.detach()**2)
+        print(delta_U)
+        if delta_U <= 0:
+            return (x - P_grad), delta_U
+        else:
+            return (x - MM_upper_bound*grad), delta_U
 
 
 class LRUR(BaseUR):
@@ -491,6 +524,64 @@ class prox_MM_l1_Linear_UR(prox_MM_l1_UR):
         return [torch.mean(flat_tensor, dim=1), torch.std(flat_tensor, dim=1), torch.max(flat_tensor, dim=1)[0]]
 
 
+class prox_MM_net_UR(nn.Module):
+    """
+    prox_MM_l1_UR with a autoencoder as learned proximal.
+    """
+    def __init__(self, subgradient_prior_net=None, mode: str = "riemann"):
+        super().__init__()
+        
+        # NN as subgradient prior network
+        self.subgradient_prior_net = subgradient_prior_net
+        self.subgradient_prior = None
+        self.mode = "riemann" # "riemann" or "euclid"
+
+    def forward(self, inner_loss, x, grad, step):
+        """
+        Args:
+            x    : current state (Tensor)
+            grad : tuple (grad, P) from grad_mod
+            P    : diagonal majorant matrix (Tensor, same shape as x)
+            step : int, step index
+        """
+        P_grad, P, grad = grad  # grad is a tuple (P_grad, P, grad)
+        z = self.forward_step(x, P_grad)
+
+        subgradient_prior = self.compute_subgradient_prior(z)
+        self.subgradient_prior = subgradient_prior.detach()  # Detach to prevent gradients flowing into the subgradient prior net
+
+        with torch.no_grad():
+            #P_grad_norm = torch.linalg.norm(P_grad, dim=(-1, -2)).mean().item()
+            P_norm = torch.linalg.norm(P, dim=(-1, -2)).mean().item()
+            # z_norm = torch.linalg.norm(z, dim=(-1, -2)).mean().item()
+            subgrad_norm = torch.linalg.norm(subgradient_prior, dim=(-1, -2)).mean().item()
+
+            #print("P_grad norm:", P_grad_norm)
+            print("P norm:", P_norm)
+            # print("z norm:", z_norm)
+            print("subgradient_prior norm:", subgrad_norm)
+
+        x_next = self.moreau_forward_step(z, P, subgradient_prior)
+        return x_next
+    
+    def forward_step(self, x, update_step):
+        z = x - update_step
+        if self.mode == "riemann":
+            z = torch.nn.functional.normalize(z, p=2, dim=(-1, -2))
+        return z
+
+    def moreau_forward_step(self, z, P, subgradient_prior):
+        x = z - P * subgradient_prior
+        if self.mode == "riemann":
+            return torch.nn.functional.normalize(x, p=2, dim=(-1, -2))
+        return x
+
+    def compute_subgradient_prior(self, z):
+        if self.mode == "riemann":
+            z = torch.nn.functional.normalize(z, p=2, dim=(-1, -2))
+        return z - self.subgradient_prior_net(z, self.mode)
+
+
 class prox_MM_l1_Linear_HisEmb_UR(prox_MM_l1_UR):
     """
     prox_MM_l1_UR with a Linear network to predict lambda_l1 at each step.
@@ -685,8 +776,9 @@ class S_MM_UR(BaseUR):
         super().__init__()
         self.temperature = temperature
         self.snr_target = snr_target
+        self.noise_scheduling_rate = 1.0
 
-    def forward(self, x, grad, step):
+    def forward(self, E, x, grad, step, steps):
         """
         Args:
             x    : current state (Tensor)
@@ -695,30 +787,60 @@ class S_MM_UR(BaseUR):
             step : int, step index
         """
         P_grad, P, grad = grad  # grad is a tuple (P_grad, P, grad)
-        if self.temperature != 0.0:
-            D = self._compute_D(P, grad, step)
-            D_hat = torch.mean(P_grad**2)/(2*self.temperature*self.snr_target)*D
-            noise = torch.sqrt(2*self.temperature*D_hat) * torch.randn_like(x)
+        mu = -P_grad  # MM descent direction
+        if self.noise_scheduling_rate != 0.0 and self.temperature != 0.0:
+            #D = self._compute_D_SNR(P_grad, P, grad, step)
+            # D = self._compute_D_trapezoidal(E, x, mu, step)
+            D = self._compute_D_trapezoidal_grad(x, mu, P, grad, step)
+            if step == 0:
+                self.D_hist = D.mean().item()
+            else:
+                self.D_hist += D.mean().item()
+            if step >= steps - 1:
+                self.D_hist += D.mean().item()
+                print(f'Mean of D: {self.D_hist/step}')
+
+            noise = torch.sqrt(2*self.temperature*D) * torch.randn_like(x)
+            # if step == 0:
+            #     self.log = {"mu": [mu.item(),], "noise": [noise.item(),]}
+            # else:
+            #     self.log["mu"].append(mu.item())
+            #     self.log["noise"].append(noise.item())
 
             if step == 0:
                 self.snr = 0.0
-            elif step < 10 - 1:
-                self.snr += torch.norm(P_grad) / (torch.norm(noise) + 1e-8)
+                self.cosine_sim = 0.0
             else:
-                self.snr /= 10
-                print(f"[Step: {step}] Average SNR of updates: {self.snr:.6f}")
+                self.snr += torch.norm(mu) / (torch.norm(noise) + 1e-8)
+                self.cosine_sim += torch.mean(torch.nn.functional.cosine_similarity(
+                                mu.flatten(start_dim=1), 
+                                noise.flatten(start_dim=1)))
+            if step >= steps - 1:
+                print(f"\n[Step: {step}] Average SNR of updates: {self.snr/(step + 1):.6f}")
+                print(f"[Step: {step}] Average Cosine Similarity of updates: {self.cosine_sim/(step + 1):.6f}")
             # print(f"[Step: {step}] norm mean: {torch.norm(P_grad):.6f}")
             # print(f"[Step: {step}] norm noise: {torch.norm(noise):.6f}")
             # print(f"[Step: {step}] mean d: {D.mean():.6f}")
             # print(f"[Step: {step}] max d: {D.max():.6f}")
             # print(f"[Step: {step}] mean p: {P.mean():.6f}")
             # print(f"[Step: {step}] max p: {P.max():.6f}")
-
-            return x - P_grad + noise  # Add noise to MM step
+            
+            if step < steps:
+                return x + mu + self.noise_scheduling_rate*noise  # Add noise to MM step
+            else:
+                x_hat = self._denoise_Tweedie(x, D, grad)
+                
+                with torch.no_grad():
+                    var_signal = torch.var(x_hat, dim=1).mean() 
+                    var_noise_removed = torch.var(x - x_hat, dim=1).mean()
+                    eSNR = 10 * torch.log10((var_signal + 1e-8) / (var_noise_removed + 1e-8))
+                    print(f"\n[Step: {step}] Estimated SNR of denoising: {eSNR:.6f}")
+                
+                return x_hat
         else:
-            return x - P_grad
+            return x + mu  # Pure MM step without noise
 
-    def _compute_D(self, P, grad, step):
+    def _compute_D_SNR(self, P_grad, P, grad, step):
         """ Compute a diagonal matrix D based on P, grad, and step."""
         P_norm = P/(P.mean(dim=tuple(range(1, P.ndim)), keepdim=True))
         if step == 0:
@@ -727,17 +849,256 @@ class S_MM_UR(BaseUR):
         
         alpha = (1.0 / self.temperature) * P * grad.pow(2)
         self.D = P_norm + torch.exp(-alpha) * (self.D - P_norm)
-        # self.D = self.D - (1/self.temperature)*P*(self.D - P_norm)*grad**2
-        return torch.clamp(self.D, min=1e-8)
+        return torch.mean(P_grad**2)/(2*self.temperature*self.snr_target)*torch.clamp(self.D, min=1e-8)
 
-    def _compute_D_trapezoidal(self, E, x, mu, step, init_D=1e-8):
+    def _compute_D_trapezoidal(self, E, x, mu, step, eps=1e-8):
         """ Compute a diagonal matrix D based on P, grad, and step."""
-        with torch.no_grad():
-            if step == 0:
-                self.D = torch.full_like(x, fill_value=init_D)
-                return self.D
+        # with torch.no_grad():
+        #     if step == 0:
+        #         self.mem_dict = {}
+        #         self.mem_dict['E'] = E.item() if torch.is_tensor(E) else E
+        #         self.mem_dict['x'] = x.detach().clone()
+        #         self.mem_dict['mu'] = mu.detach().clone()
+        #         self.mem_dict['D'] = torch.clamp(torch.abs(self.mem_dict['mu'])/(torch.abs(self.temperature*self.mem_dict['x']) + eps), min=eps)
+        #     else:
+        #         delta_E = E - self.mem_dict['E']
+        #         delta_x = x - self.mem_dict['x']
+        #         D = (self.mem_dict['D'] + delta_x*self.mem_dict['mu']/(2*self.temperature))*torch.exp(torch.clamp(delta_E / self.temperature, max=50.0)) + delta_x*mu/(2*self.temperature)
+        #         self.mem_dict['D'] = torch.nan_to_num(D, nan=1e-8, neginf=1e-8)
+        #         self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=1e-8)
+
+        #         # Update stored values for next step (backward-looking)
+        #         self.mem_dict['E'] = E.item() if torch.is_tensor(E) else E
+        #         self.mem_dict['x'].copy_(x)
+        #         self.mem_dict['mu'].copy_(mu)
+        # return self.mem_dict['D']
+
+        if step == 0:
+            self.mem_dict = {}
+            self.mem_dict['E'] = E
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+            # cov_0 = torch.var(x, unbiased=False).item()
+            # self.mem_dict['D'] = torch.clamp(torch.abs(self.mem_dict['mu'])*cov_0/(torch.abs(self.temperature*self.mem_dict['x']) + eps), min=eps)
+            self.mem_dict['D'] = torch.full_like(mu, fill_value=1e-8)
+        else:
+            delta_E = E - self.mem_dict['E']
+            delta_x = x - self.mem_dict['x']
+            D = (self.mem_dict['D'] + delta_x*self.mem_dict['mu']/(2*self.temperature))*torch.exp(torch.clamp(delta_E / self.temperature, max=50.0)) + delta_x*mu/(2*self.temperature)
+            self.mem_dict['D'] = torch.nan_to_num(D, nan=eps, neginf=eps)
+            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=eps)
+
+            # Update stored values for next step (backward-looking)
+            self.mem_dict['E'] = E
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+        return self.mem_dict['D']
+    
+
+class S_MM_UR_2(BaseUR):
+    """
+    A stochastic-majorization-minimization (MM) update rule.
+    """
+    def __init__(self, temperature: float = 1.0, snr_target=1.0, denoising=False):
+        super().__init__()
+        self.temperature = temperature
+        # self.log_temperature = nn.Parameter(torch.tensor(-7.0))
+        
+        self.denoising = denoising
+        self.noise_scheduling_rate = 1.0
+
+        self.mode = "mu"
+        self.eps = 1e-8
+
+    def forward(self, E, x, grad, lambda_max, step, step_num):
+        """
+        Args:
+            x    : current state (Tensor)
+            grad : tuple (P_grad, P, grad_E) from grad_mod
+            P    : diagonal majorant matrix (Tensor, same shape as x)
+            step : int, step index
+        """
+        # self.temperature = torch.exp(self.log_temperature * torch.log(torch.tensor(10)))
+        P_grad, P, grad_E = grad  # grad is a tuple (P_grad, P, grad_E)
+        
+        mu = -P_grad  # MM descent direction
+        if self.noise_scheduling_rate != 0.0 and self.temperature != 0.0:
+            # Post-trajectory denoising 
+            if step >= step_num and self.denoising:
+                return self._denoise_Tweedie(x, grad_E)
             
-            delta_E = E - self.E
-            delta_x = x - self.x
-            self.D = (self.D + delta_x*self.mu/self.temperature)*torch.exp(delta_E/self.temperature) + delta_x*mu/(2*self.temperature)
-        return torch.clamp(self.D, min=1e-8)
+            if step == 0 or not self.denoising:
+                x_clean = x.clone() 
+            else:
+                print("Tweedie")
+                x_clean = self._denoise_Tweedie(x, grad_E)
+
+            D = self._compute_D_trapezoidal(x_clean, E, mu, P, grad_E, lambda_max, step)
+            if self.mode == 'mud':
+                D, mask = D
+            
+            noise = torch.sqrt(2*self.temperature*D) * torch.randn_like(x)
+
+            # Logging
+            with torch.no_grad():
+                if step == 0:
+                    self.D_hist = D.mean().item()
+                    self.P_hist = P.mean().item()
+                    self.snr = 0.0
+                    self.cosine_sim = 0.0
+                else:
+                    self.D_hist += D.mean().item()
+                    self.P_hist += P.mean().item()
+                    self.snr += torch.norm(mu) / (torch.norm(noise) + 1e-8)
+                    self.cosine_sim += torch.mean(torch.nn.functional.cosine_similarity(
+                                    mu.flatten(start_dim=1), 
+                                    noise.flatten(start_dim=1)))
+
+                if step == step_num - 1:
+                    print(f"\nMean of D: {self.D_hist/(step + 1):.6f}")
+                    print(f"Mean of P: {self.P_hist/(step + 1):.6f}")
+                    print(f"[Step: {step}] Average SNR of updates: {self.snr/(step + 1):.6f}")
+                    print(f"[Step: {step}] Average Cosine Similarity of updates: {self.cosine_sim/(step + 1):.6f}")
+
+            if self.mode == 'mud':
+                # print(f"Capped elements: {(~mask).sum().item()}")
+                # print(f"mask size: {mask.size()}")
+
+                # eps = 1e-12
+
+                # # cap_rate = (~mask).float().mean()
+                # drift_retention = (
+                #     torch.where(mask, mu, torch.zeros_like(mu)).norm() / (mu.norm() + eps)
+                # )
+
+                # drift_energy_retention = (
+                #     torch.where(mask, mu, torch.zeros_like(mu)).square().sum()
+                #     / (mu.square().sum() + eps)
+                # )
+
+                # # print("cap rate:", cap_rate.item())
+                # print("drift norm retained:", drift_retention.item())
+                # print("drift energy retained:", drift_energy_retention.item())
+                return x_clean + torch.where(mask, mu, torch.zeros_like(mu)) + self.noise_scheduling_rate*noise  # Add noise to MM step
+            else:
+                return x_clean + mu + self.noise_scheduling_rate*noise  # Add noise to MM step
+        else:
+            return x + mu  # Pure MM step without noise
+
+    def _compute_D_trapezoidal(self, x, E, mu, P, grad, lambda_max, step):
+        """ Compute a diagonal matrix D based on P, grad, and step."""
+        if step == 0:
+            self.mem_dict = {}
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+            self.mem_dict['grad'] = grad.clone()
+            # self.mem_dict['D'] = self._compute_diffusion_upper_bound(grad, P, lambda_max)
+            self.mem_dict['D'] = P.clone()
+
+            # Store initial energy and P for upper bound mode = 'mu'
+            self.mem_dict['E'] = E.clone()
+            self.mem_dict['E_0'] = E.clone()
+            self.mem_dict['P_0'] = P.clone()
+            self.mem_dict['W'] = torch.zeros_like(P)  # Initialize W for mode = 'animu'
+            # self.mem_dict['D'] = torch.full_like(mu, fill_value=1e-8)
+        else:
+            delta_x = x - self.mem_dict['x'] # self.mem_dict['mu']
+            delta_E = E - self.mem_dict['E'] #(grad + self.mem_dict['grad'])*delta_x/2
+            # self.mem_dict['W'] = self.mem_dict['W'] + delta_E
+
+            exponent = torch.clamp(delta_E / self.temperature, max=50.0) # Avoid explosions
+            self.mem_dict['D'] = (self.mem_dict['D'] + delta_x*self.mem_dict['mu']/(2*self.temperature))*torch.exp(exponent) + delta_x*mu/(2*self.temperature)
+            # self.mem_dict['D'] = torch.nan_to_num(D, nan=eps, neginf=eps)
+            
+            d_cap = self._compute_diffusion_upper_bound(E, grad, P, lambda_max, eps=self.eps)
+                
+            if self.mode == "mud":
+                keep_mask = self.mem_dict['D'] <= d_cap
+                self.mem_dict['D'] = torch.where(keep_mask, self.mem_dict['D'] , d_cap)
+            else:
+                self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], max=d_cap)
+
+            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=self.eps)
+
+            # Update stored values for next step (backward-looking)
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+            self.mem_dict['grad'] = grad.clone()
+            self.mem_dict['E'] = E.clone()
+
+        if self.mode == "mud" and step != 0:
+            return self.mem_dict['D'], keep_mask
+        elif self.mode == "mud" and step == 0:
+            return self.mem_dict['D'], torch.ones_like(self.mem_dict['D'], dtype=torch.bool)
+        else:
+            return self.mem_dict['D']
+    
+    def _denoise_Tweedie(self, x, grad):
+        """ 
+        Analytical denoising function based on Tweedie's formula and Stationary Score Matching.
+        
+        According to Tweedie's formula, the optimal denoised state is:
+            x_hat = x + sigma^2 * nabla_x(log p(x))
+        
+        For a Langevin dynamics system converging to a stationary Gibbs distribution:
+            pi(x) = (1/Z) * exp(-E(x) / T) <=> nabla_x(log pi(x)) = -nabla_x(E(x)) / T
+            
+        Given the injected Langevin noise variance is sigma^2 = 2*T*D, the formula simplifies to:
+            x_hat = x + (2*T*D) * (-nabla_x(E(x)) / T) = x - 2 * D * nabla_x(E(x))
+
+        Args:
+            x (torch.Tensor): The current noisy state, typically at the final step K.
+            D (torch.Tensor): The diffusion matrix (variance modulator) evaluated at x.
+            grad (torch.Tensor): The gradient of the energy function nabla_x(E(x)) evaluated at x.
+
+        Returns:
+            torch.Tensor: The clean, denoised state x_hat.
+        """
+        # print(torch.norm((2 * self.mem_dict['D'] * grad).detach()))
+        return x - (2 * self.mem_dict['D'] * grad).detach()
+
+    def _compute_diffusion_upper_bound(self, E, grad, P, lambda_max, eps):
+        mode = self.mode.lower()
+        if mode in ['mix', 'max', 'min', 'geo']:
+            lambda_max = torch.clamp(lambda_max, min=eps)
+            margin = torch.clamp(1 - lambda_max*P/2.0, min=0.0)
+            num = P*margin*(grad**2)
+            den = lambda_max*self.temperature
+            d_geo = num/den
+
+        if mode == 'mix':
+            # d_max = d.amax(dim=list(range(1, d.ndim)), keepdim=True)
+            # P_max = P.amax(dim=list(range(1, P.ndim)), keepdim=True)
+            # d_tilde = (d/(d_max + eps)) #.detach()
+            # P_tilde = P/(P_max + eps)
+
+            # diff_sq = (d_tilde - P_tilde)**2
+            # alpha = diff_sq / (d_tilde**2 + P_tilde**2 + eps)
+
+            #alpha = torch.clamp((torch.exp(E/self.temperature) - 1)/(torch.exp(self.mem_dict['E_0']/self.temperature) - 1), min=0.0, max=1.0)
+            a = torch.clamp(E / self.temperature, min=0.0)
+            b = torch.clamp(self.mem_dict['E_0'] / self.temperature, min=eps)
+            a_cap = torch.minimum(a, b)
+
+            num = torch.exp(a_cap - b) * (-torch.expm1(-a_cap))
+            den = -torch.expm1(-b)
+            alpha = torch.clamp(num / den, min=0.0, max=1.0)
+
+            d_mu = self.mem_dict['P_0'] * torch.exp(torch.clamp((E - self.mem_dict['E_0']) / self.temperature, max=50.0))
+
+            return alpha*d_mu + (1 - alpha)*torch.min(d_mu, d_geo)
+        
+        elif mode == 'max':
+            return torch.max(P, d_geo)
+        elif mode == 'min':
+            return torch.min(P, d_geo)
+        elif mode == 'mu' or mode == 'mud':
+            return self.mem_dict['P_0'] * torch.exp(torch.clamp((E - self.mem_dict['E_0']) / self.temperature, max=50.0))
+        elif mode == 'animu':
+            return self.mem_dict['P_0'] * torch.exp(torch.clamp(self.mem_dict['W'] / self.temperature, max=50.0))
+        elif mode == 'geo':
+            return d_geo
+        elif mode == 'p':
+            return P
+        else:
+            raise ValueError(f"Invalid mode: {mode}")

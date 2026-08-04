@@ -20,8 +20,6 @@ def main(cfg:DictConfig):
     # print(f"{next(iter(val_dl))[0].shape=}")
 
     litmodel = hydra.utils.call(cfg.litmodel)
-    for p in litmodel.l2o.reg_net.parameters(): 
-        print(p.mean())
     print(litmodel)
     # for k, p in litmodel.named_parameters():
     #     print(f"{k}: {p.numel()}")

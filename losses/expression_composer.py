@@ -138,13 +138,19 @@ class ExpressionLossComposer(nn.Module):
     def _build_context(self, **kwargs):
         """
         Create execution context for eval() of each term.
-        Context priority:
-            kwargs > external_vars
+        Context priority: kwargs > external_vars
         """
         context = {}
         context.update(self.external_vars)
         context.update(self._buffers)
         context.update(kwargs)
+        
+        dtype = next(self.parameters()).dtype if list(self.parameters()) else torch.float32
+        for k, v in context.items():
+            if isinstance(v, torch.Tensor):
+                context[k] = v.to(dtype=dtype)
+            elif isinstance(v, nn.Module):
+                context[k] = v.to(dtype=dtype)   
         return context
     
     # Evaluate 1 intermediate expression safely

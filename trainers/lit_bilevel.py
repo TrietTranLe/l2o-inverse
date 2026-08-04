@@ -16,7 +16,7 @@ Compatible with PyTorch Lightning and Hydra.
 import torch
 import pytorch_lightning as pl
 from optimizers.outer_optimizer import build_outer_optimizer_and_scheduler
-from optimizers.builders.outer_optimizer_builder import build_outer_param_groups
+from optimizers.builders.outer_optimizer_builder import build_outer_param_groups, build_outer_param_groups_prox
 
 
 class LitBiLevel(pl.LightningModule):
@@ -91,8 +91,11 @@ class LitBiLevel(pl.LightningModule):
         x_inner, inner_losses, _ = self.l2o(x, y, steps=self.inner_steps, return_all=True)
 
         # ---- Outer/meta loss ----
-        train_loss = self.outer_loss(x_inner=x_inner, x_true=x, AE=self.l2o.reg_net)
+        # train_loss, terms = self.outer_loss(x_inner=x_inner, x_true=x, x_true_unit=torch.nn.functional.normalize(x, p=2, dim=(-1, -2)),
+        #                                     AE=self.l2o.update_rule.subgradient_prior_net, return_terms=True)
+        train_loss, terms = self.outer_loss(x_inner=x_inner, x_true=x, AE=self.l2o.reg_net, return_terms=True)
 
+        print(f"Outer loss terms: {terms}")
         # ---- Logging ----
         self.log("train/outer_loss", train_loss, prog_bar=True, on_epoch=True)
         self.log("train/inner_loss_last", inner_losses[-1])
@@ -126,40 +129,42 @@ class LitBiLevel(pl.LightningModule):
 
         with torch.no_grad():
             x_inner = self.l2o(x, y, steps=self.inner_steps)
-            val_loss = self.outer_loss(x_inner=x_inner, x_true=x, AE=self.l2o.reg_net)
+            # val_loss, terms = self.outer_loss(x_inner=x_inner, x_true=x, x_true_unit=torch.nn.functional.normalize(x, p=2, dim=(-1, -2)),
+            #                                   AE=self.l2o.update_rule.subgradient_prior_net, return_terms=True)
+            val_loss, terms = self.outer_loss(x_inner=x_inner, x_true=x, AE=self.l2o.reg_net, return_terms=True)
 
+        print(f"Validation outer loss terms: {terms}")
         self.log("val/outer_loss", val_loss, prog_bar=True, on_epoch=True)
         return val_loss
 
 
-    def on_train_epoch_start(self):
-        epoch = self.current_epoch
+    # def on_train_epoch_start(self):
+    #     epoch = self.current_epoch
 
-        # Dynamic scheduling of update rule parameters (e.g., temperature) based on epoch
-        try:
-            if self.l2o.update_rule.temperature != 0.0 and not hasattr(self, "T_max"):
-                self.T_max = self.l2o.update_rule.temperature
-        except AttributeError:
-            pass
+    #     # Dynamic scheduling of update rule parameters (e.g., temperature) based on epoch
+    #     try:
+    #         if self.l2o.update_rule.temperature != 0.0 and not hasattr(self, "T_max"):
+    #             self.T_max = self.l2o.update_rule.temperature
+    #     except AttributeError:
+    #         pass
     
-        if hasattr(self, "T_max"):
-            temp_start = 0.1
-            epoch_th_stage_list = [50, 250]
+    #     if hasattr(self, "T_max"):
+    #         noise_scheduling_rate_0 = 0.0
+    #         noise_scheduling_rate_final = 1.0
+    #         epoch_th_stage_list = [50, 250]
 
-            if epoch < epoch_th_stage_list[0]:
-                temperature = 0.0
+    #         if epoch < epoch_th_stage_list[0]:
+    #             noise_scheduling_rate = noise_scheduling_rate_0
 
-            elif epoch_th_stage_list[0] <= epoch < epoch_th_stage_list[1]:
-                progress = (epoch - epoch_th_stage_list[0]) / (epoch_th_stage_list[1] - epoch_th_stage_list[0])
-                temperature = self.T_max * (progress ** 2)
-                temperature = (temp_start + (1 - temp_start) * (progress ** 2)) * self.T_max
-            else:
-                temperature = self.T_max
+    #         elif epoch_th_stage_list[0] <= epoch < epoch_th_stage_list[1]:
+    #             progress = (epoch - epoch_th_stage_list[0]) / (epoch_th_stage_list[1] - epoch_th_stage_list[0])
+    #             noise_scheduling_rate = noise_scheduling_rate_0 + progress * (noise_scheduling_rate_final - noise_scheduling_rate_0)
+    #         else:
+    #             noise_scheduling_rate = noise_scheduling_rate_final
 
-            self.l2o.update_rule.temperature = temperature
-            self.log("train/temperature", temperature, prog_bar=True, logger=True)
-            if epoch == 0 or (epoch_th_stage_list[0] <= epoch <= epoch_th_stage_list[1]):
-                print(f"[Epoch {epoch}] Update rule temperature set to: {temperature:.4f}")
+    #         self.l2o.update_rule.noise_scheduling_rate = noise_scheduling_rate
+    #         if epoch == 0 or (epoch_th_stage_list[0] < epoch <= epoch_th_stage_list[1]):
+    #             print(f"[Epoch {epoch}] Update rule noise scheduling rate set to: {noise_scheduling_rate:.4f}")
 
     # -------------------------------------------------------------------------
     def configure_optimizers(self):
@@ -170,7 +175,7 @@ class LitBiLevel(pl.LightningModule):
         """
         lr_groups = self.outer_opt_cfg.get("lr_groups", None)
         default_lr = self.outer_opt_cfg.get("lr", 1e-4)
-        param_groups = build_outer_param_groups(l2o=self.l2o, lr_groups=lr_groups, default_lr=default_lr)
+        param_groups = build_outer_param_groups_prox(l2o=self.l2o, lr_groups=lr_groups, default_lr=default_lr)
 
         if len(param_groups) == 0:
             print("[LitBiLevel] No trainable parameters for outer optimizer.")

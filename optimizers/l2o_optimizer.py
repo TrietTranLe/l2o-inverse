@@ -1,3 +1,5 @@
+import math
+
 import torch 
 from torch import nn
 import numpy as np
@@ -9,6 +11,7 @@ class EsiGradSolver(nn.Module):
                 *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.reg_net = reg_net
+        # self.reg_net = None
         self.grad_mod = grad_mod
         self.update_rule = update_rule
         self.inner_loss = inner_loss
@@ -37,34 +40,57 @@ class EsiGradSolver(nn.Module):
         Returns:
             final_state or (final_state, inner_losses)
         """
+        # torch.autograd.set_detect_anomaly(True)
         if steps is None:
             steps = self.n_steps
 
         with torch.set_grad_enabled(True):
             # Initialize state
             state = self.init_state(x, y)
+
+            # Normalize the output to lie on the unit sphere (Riemannian optimization on sphere)
+            # if self.update_rule.mode == "riemann":
+            #     state = torch.nn.functional.normalize(state, p=2, dim=(-1, -2))
+
             self.grad_mod.reset_state(x)
 
-            inner_losses: list[torch.Tensor] = []
+            list_inner_loss: list[torch.Tensor] = []
+            list_delta_U: list[torch.Tensor] = []
             full_terms: dict = {}
 
             # Unrolled inner loop
-            for step in range(steps):
+            # Post-trajectory denoising 
+            last_denoising = False
+            if last_denoising:
+                total_steps = steps + 1
+            else:
+                total_steps = steps
+
+            # print(f"Running inner optimization for {total_steps} steps...")
+            for step in range(total_steps):
                 # compute inner loss
                 inner_loss, terms, intermediate = self.inner_loss(x=state, y=y, AE=self.reg_net, return_terms=True, return_intermediate=True)
-                 
-                inner_losses.append(inner_loss.detach())
+                # inner_loss, terms, intermediate = self.inner_loss(x=state, y=y, return_terms=True, return_intermediate=True)
+                # print(f"Inner loss terms: {terms}")
+            
+                list_inner_loss.append(inner_loss)
                 for k, v in terms.items():
                     if k not in full_terms.keys():
                         full_terms[k] = [v.detach(),]
                     else:
                         full_terms[k].append(v.detach())
+
                 # gradient wrt state
                 grad = torch.autograd.grad(
                     inner_loss,
                     state,
                     create_graph=True,
-                )[0]                    
+                )[0]
+
+                # TODO: Decoupling the graph between solver-net (grad_mod) and prior-net (reg_net) 
+                # Jacobian-free gradient modification: we don't want the grad_mod to affect the backward graph of reg_net,
+                # It can work as a "black-box" prior-net that can transform the loss landscape to make it easier for the solver-net to optimize,
+                # instead of being a "white-box" that can learn a "real" prior from the data.
 
                 # track grad norm
                 self.last_grad_norm = grad.detach().norm()
@@ -72,38 +98,67 @@ class EsiGradSolver(nn.Module):
                 # compute bounds (optional)
                 if self.bound_estimating_steps is not None:
                     if self.bound_estimating_steps == 0:
-                        from collections import deque
-                        flatten_dict = {}
-                        queue = deque([(None, intermediate)]) # (parent_key, current_dict)
-                        while queue:
-                            parent, current = queue.popleft()
-                            for k, v in current.items():
-                                full_key = f"{parent}.{k}" if parent else k
-                                if isinstance(v, dict):
-                                    queue.append((full_key, v))
-                                else:
-                                    flatten_dict[full_key] = v
-                        print(flatten_dict.keys())
-                        print(1/"r")
-                        bounds = self.compute_bounds(intermediate, state, grad)
+                        # from collections import deque
+                        # flatten_dict = {}
+                        # queue = deque([(None, intermediate)]) # (parent_key, current_dict)
+                        # while queue:
+                        #     parent, current = queue.popleft()
+                        #     for k, v in current.items():
+                        #         full_key = f"{parent}.{k}" if parent else k
+                        #         if isinstance(v, dict):
+                        #             queue.append((full_key, v))
+                        #         else:
+                        #             flatten_dict[full_key] = v
+                        # print(flatten_dict.keys())
+                        # print(1/"r")
+                        # bounds = self.compute_bounds(intermediate, state, grad)
+                        bounds = self.compute_bound_analytical(intermediate)
                     else:
                         bounds = self.estimate_bounds(inner_loss, state, grad, self.bound_estimating_steps)
                 else:
                     bounds = None
 
                 # apply grad modifier
-                grad = self.grad_mod(state, grad, bounds)
-
+                # grad = self.grad_mod(state, grad, bounds)
+                grad = self.grad_mod(state, grad, bounds[:2])
+                
+                # if step == 0:
+                #     MM_upper_bound = bounds[1] if bounds is not None else torch.zeros_like(grad)
+                #     draft_step_z = self.update_rule.forward_step(state, MM_upper_bound*grad)
+                #     draft_subgradient_prior = self.update_rule.compute_subgradient_prior(draft_step_z).detach()
+                #     grad = self.grad_mod(state, grad + draft_subgradient_prior, bounds)
+                # else:
+                #     grad = self.grad_mod(state, grad + self.update_rule.subgradient_prior, bounds)
+                
                 # apply update rule
-                state = self.update_rule(state, grad, step)
+                # state = self.update_rule(state, grad, step)
+                state = self.update_rule(inner_loss, state, grad, bounds[-1], step, steps)
+                # state, delta_U = self.update_rule(state, grad, bounds[1], step)
+                # list_delta_U.append(delta_U)
+
+                #if step == steps - 1 and self.update_rule.mode == "riemann":
+                # with torch.no_grad():
+                #     if step == steps - 1:
+                #         # Revert normalizing to the original scale
+                #         # x_ori = c*x
+                #         # c = argmin_c ||c*L*state - y||_2^2
+                #         # => c = y^T (L*state) / ||L*state||_2^2
+                #         L = intermediate['input']['L']
+                #         y_hat = L@state
+
+                #         c = torch.sum(y * y_hat, dim=(-1, -2), keepdim=True)/(torch.sum(y_hat * y_hat, dim=(-1, -2), keepdim=True) + 1e-8).detach()
+                #         # print(f"c: {c.mean().item()}")
+                #         state = c*state
 
                 # in eval mode, detach to avoid graph growth
                 if not self.training:
                     state = state.detach().requires_grad_(True)
 
-            return (state, inner_losses, full_terms) if return_all else state
+            return (state, list_inner_loss, full_terms) if return_all else state
 
-    def compute_bound_analytical(self, loss_intermediate, lambda_val: float = 1.0, eps_softrelu: float = 0.1, eps_div: float = 1e-8):
+
+
+    def compute_bound_analytical_data(self, loss_intermediate, eps_div: float = 1e-8):
         """
         Compute the upper and lower bounds for p(x) using analytical bounds 
         for the Jacobian (rho) and Hessian (alpha), instead of autograd.
@@ -123,48 +178,147 @@ class EsiGradSolver(nn.Module):
             lower_bound (Tensor): Tensor of size x (approx 0).
             upper_bound (Tensor): Tensor of size x containing the upper bound values.
         """
-        L = loss_intermediate['input.L']
-        x = loss_intermediate['input.x']
-        Lx = loss_intermediate['data.L@x']      # Pre-computed L*x
-        Phi_x = loss_intermediate['reg.AE(x)']  # Pre-computed Phi(x)
-        
-        s = Phi_x.numel() # Dimension of the output vector s
-        
-        # Basic Norms
-        x_norm = torch.norm(x)
-        beta = torch.norm(Phi_x)      # beta = ||Phi(x)||
-        Lx_norm = torch.norm(Lx)
-        L_op = torch.norm(L) 
+        with torch.no_grad():
+            x = loss_intermediate['input']['x']
+            L = loss_intermediate['input']['L']
+            Lx = loss_intermediate['data']['L@x']
+            
+            # Compute mu1
+            LTL = torch.matmul(L.T, L)
 
-        # Compute RHO and ALPHA analytically
-        rho = compute_rho_analytical(ae_layers)
-        alpha = compute_alpha_analytical(ae_layers, epsilon=eps_softrelu)
-        
-        # Safeguards to prevent division by zero
-        beta_safe = max(beta, eps_div)
-        x_norm_safe = max(x_norm, eps_div)
-        Lx_norm_safe = max(Lx_norm, eps_div)
-        
-        # mu1 = 5 * ||L||^2 / ||Lx||^2
-        mu1 = 5.0 * (L_op ** 2) / (Lx_norm_safe ** 2)
+            Lx_norm_2 = torch.sum(Lx ** 2, dim=list(range(1, Lx.dim())), keepdim=True) # shape (batch, 1, 1)
+            LTL_norm_1 = torch.sum(torch.abs(LTL), dim=1, keepdim=True).unsqueeze(0)  # ||L^T L||_1, shape (1, sources, 1)
 
-        # mu2 = (1/(beta*||x||)) * (5*rho + 1) 
-        #       + (2*alpha*sqrt(s))/beta 
-        #       + 4 * (rho/beta + 1/||x||)^2
-        mu2 = (1.0 / (beta_safe * x_norm_safe)) * (5.0 * rho + 1.0) + \
-              (2.0 * alpha * np.sqrt(s)) / beta_safe + \
-              4.0 * ((rho / beta_safe) + (1.0 / x_norm_safe)) ** 2
+            # mu1 = 2/sqrt(3) * LTL / ||Lx||^2
+            mu1 = 2.0 / math.sqrt(3) * (LTL_norm_1) / (Lx_norm_2 + eps_div).expand_as(x)
 
-        # Upper bound = 1 / (mu1 + lambda * mu2)
-        val_upper = 1.999 / (mu1 + lambda_val * mu2 + eps_div)
-        
-        # Expand scalar result to tensor matching x's shape
-        upper_bound = torch.full_like(x, val_upper.item())
-        
-        # Lower bound (nu > 0, approximated by eps)
-        lower_bound = torch.full_like(x, eps_div)
+            # Upper bound = 1 / mu1
+            upper_bound = (1.999 / mu1).detach()
+            # print(f"upper_bound: {upper_bound.mean().item()}")
+            
+            # Lower bound (nu > 0, approximated by eps)
+            lower_bound = torch.full_like(upper_bound, eps_div).detach()
 
-        return lower_bound, upper_bound
+            return lower_bound, upper_bound
+        
+
+    def compute_bound_analytical(self, loss_intermediate, lambda_val: float = 1.0, 
+                                 beta: float = 1.0, W_spectral_prod: float = 1.0, 
+                                 ReLU_eps: float = 10.0, eps_div: float = 1e-8):
+        """
+        Compute the upper and lower bounds for p(x) using analytical bounds.
+        
+        Args:
+            loss_intermediate (dict): Input data dictionary.
+            lambda_val (float): Regularization coefficient lambda.
+            beta (float): Tightness parameter for Young's inequality.
+            W_spectral_prod (float): Precomputed product of spectral norms of AE weight matrices.
+            ReLU_eps (float): Epsilon used in SoftReLU activation (for residual curvature calculation).
+            eps_div (float): Small constant to avoid division by zero.
+        
+        Returns:
+            lower_bound (Tensor): Tensor of size x (approx 0).
+            upper_bound (Tensor): Tensor of size x containing the upper bound values.
+        """
+        with torch.no_grad():
+            x = loss_intermediate['input']['x']
+            L = loss_intermediate['input']['L']
+            Lx = loss_intermediate['data']['L@x']
+            Phi_x = loss_intermediate['reg']['AE(x)']
+            
+            # --- 1. DATA TERM ---
+            L_spectral_sq = torch.linalg.matrix_norm(L, ord=2) ** 2
+            Lx_norm_2_sq = torch.sum(Lx ** 2, dim=list(range(1, Lx.dim())), keepdim=True)
+            
+            mu_data = (2.0 * L_spectral_sq) / (math.sqrt(3) * Lx_norm_2_sq + eps_div)
+
+            # --- 2. GAUSS-NEWTON PRIOR TERM ---
+            norm_x_sq = torch.sum(x ** 2, dim=(1, 2), keepdim=True)
+            norm_Phi_x_sq = torch.sum(Phi_x ** 2, dim=(1, 2), keepdim=True)
+            
+            sqrt3 = math.sqrt(3.0)
+            term_x = ((2.0 + sqrt3 * beta) / sqrt3) / (norm_x_sq + eps_div)
+            term_Phi = W_spectral_prod * ((2.0 * beta + sqrt3) / (sqrt3 * beta)) / (norm_Phi_x_sq + eps_div)
+            
+            mu_GN = term_x + term_Phi
+            
+            # --- 3. RESIDUAL PRIOR TERM (Worst-case bound) ---
+            mu_res = 1/(2* ReLU_eps) * loss_intermediate['reg']['AE'].sum_W / (math.sqrt(norm_Phi_x_sq) + eps_div)
+
+            # --- 4. TOTAL CURVATURE & SCALE SYNCHRONIZATION ---
+            mu_total_scalar = mu_data + lambda_val * (mu_GN + mu_res)
+
+            mu_total = mu_total_scalar.expand_as(x)
+
+            # --- 5. FINAL BOUNDS ---
+            upper_bound = 1.9999 / (mu_total + eps_div)
+            lower_bound = torch.full_like(upper_bound, eps_div)
+
+            return lower_bound.detach(), upper_bound.detach()
+
+
+    # def compute_bound_analytical(self, loss_intermediate, lambda_val: float = 1.0, eps_softrelu: float = 0.1, eps_div: float = 1e-8):
+    #     """
+    #     Compute the upper and lower bounds for p(x) using analytical bounds 
+    #     for the Jacobian (rho) and Hessian (alpha), instead of autograd.
+
+    #     Mathematical bounds:
+    #         Upper Bound = 1 / (mu1 + lambda * mu2) * 1
+    #         Lower Bound = eps
+
+    #     Args:
+    #         loss_intermediate (dict): Input data dictionary.
+    #                                 Keys required: 'input.L', 'input.x', 'data.L@x', 'reg.AE(x)'
+    #         lambda_val (float): Regularization coefficient lambda.
+    #         eps_softrelu (float): Epsilon used in SoftReLU activation (for alpha calculation).
+    #         eps_div (float): Small constant to avoid division by zero.
+        
+    #     Returns:
+    #         lower_bound (Tensor): Tensor of size x (approx 0).
+    #         upper_bound (Tensor): Tensor of size x containing the upper bound values.
+    #     """
+    #     L = loss_intermediate['input.L']
+    #     x = loss_intermediate['input.x']
+    #     Lx = loss_intermediate['data.L@x']      # Pre-computed L*x
+    #     Phi_x = loss_intermediate['reg.AE(x)']  # Pre-computed Phi(x)
+        
+    #     s = Phi_x.numel() # Dimension of the output vector s
+        
+    #     # Basic Norms
+    #     x_norm = torch.norm(x)
+    #     beta = torch.norm(Phi_x)      # beta = ||Phi(x)||
+    #     Lx_norm = torch.norm(Lx)
+    #     L_op = torch.norm(L) 
+
+    #     # Compute RHO and ALPHA analytically
+    #     rho = compute_rho_analytical(ae_layers)
+    #     alpha = compute_alpha_analytical(ae_layers, epsilon=eps_softrelu)
+        
+    #     # Safeguards to prevent division by zero
+    #     beta_safe = max(beta, eps_div)
+    #     x_norm_safe = max(x_norm, eps_div)
+    #     Lx_norm_safe = max(Lx_norm, eps_div)
+        
+    #     # mu1 = 5 * ||L||^2 / ||Lx||^2
+    #     mu1 = 5.0 * (L_op ** 2) / (Lx_norm_safe ** 2)
+
+    #     # mu2 = (1/(beta*||x||)) * (5*rho + 1) 
+    #     #       + (2*alpha*sqrt(s))/beta 
+    #     #       + 4 * (rho/beta + 1/||x||)^2
+    #     mu2 = (1.0 / (beta_safe * x_norm_safe)) * (5.0 * rho + 1.0) + \
+    #           (2.0 * alpha * np.sqrt(s)) / beta_safe + \
+    #           4.0 * ((rho / beta_safe) + (1.0 / x_norm_safe)) ** 2
+
+    #     # Upper bound = 1 / (mu1 + lambda * mu2)
+    #     val_upper = 1.999 / (mu1 + lambda_val * mu2 + eps_div)
+        
+    #     # Expand scalar result to tensor matching x's shape
+    #     upper_bound = torch.full_like(x, val_upper.item())
+        
+    #     # Lower bound (nu > 0, approximated by eps)
+    #     lower_bound = torch.full_like(x, eps_div)
+
+    #     return lower_bound, upper_bound
 
 
     def estimate_bounds(self, loss, state: torch.Tensor, grad: torch.Tensor | None = None, steps: int = 3, safety: float = 1.0, eps: float = 1e-8):
@@ -220,9 +374,10 @@ class EsiGradSolver(nn.Module):
             v = Hv_flat / normHv
             lam = normHv.squeeze(1)  # shape (b,)
 
-        bound_max = 1.999/(safety * lam)
+        bound_max = (1.999/(safety * lam)).expand_as(grad)
         bound_min = torch.full_like(bound_max, eps)
-        return bound_min, bound_max
+        # print(lam.mean().item(), bound_max.mean().item())
+        return bound_min.detach(), bound_max.detach(), lam.expand_as(grad).detach()
 
     def init_state(self, x, y, x_init=None):
         if x_init is not None:

@@ -27,7 +27,7 @@ from torch import nn
 
 from data.eeg.data import EsiDatamodule, EsiDataset
 from losses.builtins.cosine import CosineSimilarityFlatLoss
-from data.eeg.utils_eeg import (load_fwd, load_mne_info,
+from data.eeg.utils_eeg import (find_exp, load_fwd, load_mne_info,
                                    load_model_from_conf, plot_source_estimate,
                                    plot_src_from_imgs)
 from data.eeg.utils_eeg import signal_to_windows, windows_to_signal, windows_to_signal_center
@@ -46,7 +46,10 @@ parser.add_argument("-mw", "--model_weight", type=str, help="model weight name",
 
 
 parser.add_argument("-test_ovr", "--test_overrides", nargs="*", help="test dataset overrides")
-parser.add_argument("-i", "--eval_idx", type=int, help="index of data for visualisation", default=2)
+parser.add_argument("-i", "--eval_idx", type=int, help="index of data for visualisation", default=4)
+parser.add_argument("-lfc", "--leadfield_conductivity", type=str, help="leadfield conductivity", default='1:50')
+parser.add_argument("-nsnr", "--noise_snr", type=int, help="noise signal-to-noise ratio", default=5)
+
 parser.add_argument("-sv", "--surfer_view", type=str, default="lat", help="surfer view if different from the one in the default file")
 parser.add_argument("-sh", "--show", action="store_true")
 parser.add_argument("-tdc", "--test_data_config", type=str, help="test dataset config file", default='test_ses_sereega_fsav994_125ms.yaml')
@@ -55,6 +58,7 @@ parser.add_argument("-ovlp", "--overlap", type=int, default=7, help="overlap for
 parser.add_argument("-wl", "--window_length", type=int, default=7, help="length of time window")
 parser.add_argument("-ott", "--on_train", action="store_true", help="on train dataset")
 parser.add_argument("-sub", "--subset_name", type=str, default="left_back", help="name of the training subset to use")
+parser.add_argument("-pub", "--publication", action="store_false", help="Plot cortex for publication purposes")
 args = parser.parse_args()
 
 #-----
@@ -125,11 +129,24 @@ test_dl = dm.test_dataloader()
 #----
 fwd = hydra.utils.call(cfg.fwd)
 # mne_info = hydra.utils.call(cfg.mne_info)
-leadfield = torch.from_numpy(fwd['sol']['data']).float()
+
+model_folder = Path( f"{test_config.datafolder}/{test_config.subject_name}/{test_config.orientation}/{test_config.electrode_montage}/{test_config.source_sampling}/model" )
+
+# Load a different leadfield
+if args.leadfield_conductivity != "1:50":
+    # Load a different leadfield
+    leadfield_conductivity_list = ["1:20", "1:50", "1:80"]
+    if args.leadfield_conductivity not in leadfield_conductivity_list:
+        print(f"Leadfield conductivity {args.leadfield_conductivity} not supported. Please choose from {leadfield_conductivity_list}")
+        sys.exit()
+    mat_data = loadmat(f'{model_folder}/LF_fsav_994_{args.leadfield_conductivity}.mat')
+    leadfield = torch.from_numpy(mat_data['G']).float()
+else:
+    leadfield = torch.from_numpy(fwd['sol']['data']).float()
+fwd['sol']['data'] = leadfield.detach().clone().numpy()
 
 ### load vertices data to view source ###
 ### load the 2 source spaces and region mapping
-model_folder = Path( f"{test_config.datafolder}/{test_config.subject_name}/{test_config.orientation}/{test_config.electrode_montage}/{test_config.source_sampling}/model" )
 fwd_vertices = mne.read_forward_solution(
     f"{model_folder}/fwd_verticesfsav_994-fwd.fif"
 )
@@ -142,7 +159,7 @@ fwd_regions = mne.convert_forward_solution(
 )
 
 ## !! assign fwd_region the proper leadfield matrix values (summed version)
-fwd_regions["sol"]["data"] = leadfield.numpy()
+fwd_regions["sol"]["data"] = leadfield
 
 region_mapping = loadmat(f"{model_folder}/fs_cortex_20k_region_mapping.mat")[
     "rm"
@@ -150,6 +167,7 @@ region_mapping = loadmat(f"{model_folder}/fs_cortex_20k_region_mapping.mat")[
 
 n_vertices = fwd_vertices["nsource"]
 n_regs = len(np.unique(region_mapping))
+
 #-----
 ### --- LOAD MODEL --- ###
 import sys
@@ -200,6 +218,18 @@ idx_v = idx
 
 TrainingItem = namedtuple('TrainingItem', ['input', 'tgt']) # batch format for 4DVARNET
 eeg, src = dm.test_ds[idx_v]
+
+# Change leadfield
+eeg = leadfield @ src
+
+num_elec, num_time = eeg.shape
+sig_power = torch.square(torch.linalg.norm(eeg, dim=1)) / num_time
+noise_power = (10 ** (-(args.noise_snr / 10))) * sig_power / 2
+noise_std = torch.sqrt(noise_power)
+noise_distribution = torch.randn_like(eeg)
+noise_matrix = noise_distribution * noise_std[:, None]
+eeg = eeg + noise_matrix.detach().clone()
+
 batch = TrainingItem(input=eeg.unsqueeze(0), tgt=src.unsqueeze(0))
 idx_v = 0
 
@@ -263,7 +293,7 @@ with torch.no_grad():
         output_ae = litmodel.l2o.reg_net(output)
         output = torch.from_numpy( windows_to_signal(output.unsqueeze(1), overlap=overlap, n_times=batch.input.shape[-1]) )
         output_ae = torch.from_numpy( windows_to_signal(output_ae.unsqueeze(1), overlap=overlap, n_times=batch.input.shape[-1]) )
-    else : 
+    else :        
         output, inner_losses, full_terms = litmodel.l2o(batch.tgt, batch.input, return_all=True)
         output = output.detach()
         output_ae = litmodel.l2o.reg_net(output)
@@ -354,7 +384,6 @@ noise_eeg = mne.io.RawArray(
 noise_cov = mne.compute_raw_covariance(noise_eeg, verbose=False)
 lambda2 = 1.0 / (test_config.snr_db**2) ## !! this could be tuned to improve the results
 
-
 inv_op = mne.minimum_norm.make_inverse_operator(
     info=raw_eeg.info,
     forward=fwd,
@@ -377,6 +406,25 @@ mne_output = stc_mne.data
 slo_output = stc_slo.data
 ## eval time / visu time : max activity
 t_max = np.argmax( batch.tgt[idx_v,:,:].squeeze().abs().sum(0).numpy() )
+
+# RAP-MUSIC
+evoked_eeg = mne.EvokedArray(raw_eeg.get_data(), raw_eeg.info, tmin=raw_eeg.times[0])
+n_dipoles = dm.test_ds.md[idx_v]['n_patch']
+dipoles = mne.beamformer.rap_music(
+    evoked=evoked_eeg,
+    forward=fwd,
+    noise_cov=noise_cov,
+    n_dipoles=n_dipoles,
+    verbose=False
+)
+n_sources = fwd['source_rr'].shape[0]
+n_times = raw_eeg.n_times
+stc_rap = np.zeros((n_sources, n_times))
+for dip in dipoles:
+    distances = np.linalg.norm(fwd['source_rr'] - dip.pos[0], axis=1)
+    best_idx = np.argmin(distances)   
+    stc_rap[best_idx, :] += np.squeeze(dip.amplitude)
+rap_output = stc_rap
 
 ######
 # 24 oct
@@ -452,6 +500,7 @@ le_lstm, auc_lstm = le_and_auc(fwd, neighbors, s, src, lstm_output[idx_v,:,:].nu
 le_cnn, auc_cnn = le_and_auc(fwd, neighbors, s, src, cnn_output[idx_v,:,:].numpy() )
 le_mne, auc_mne = le_and_auc(fwd, neighbors, s, src, mne_output )
 le_slo, auc_slo = le_and_auc( fwd, neighbors, s, src, slo_output )
+le_rap, auc_rap = le_and_auc( fwd, neighbors, s, src, rap_output )
 
 ###
 fs = mne_info['sfreq']
@@ -465,11 +514,13 @@ _, gt_ae_verts = reg_to_verts_src(gt_ae[idx_v,:,:].detach().squeeze().numpy(), n
 img_gt_ae = plot_source_estimate(src=gt_ae_verts, t_max=t_max, fwd=fwd_vertices,fs=512, surfer_view=args.surfer_view)
 
 
-
 _, lstm_verts = reg_to_verts_src(lstm_output[idx_v,:,:].squeeze().numpy(), n_vertices, region_mapping, fwd_vertices, fs)
 img_lstm = plot_source_estimate(src=lstm_verts, t_max=t_max, fwd=fwd_vertices,fs=512, surfer_view=args.surfer_view)
 _, cnn_verts = reg_to_verts_src(cnn_output[idx_v,:,:].squeeze().numpy(), n_vertices, region_mapping, fwd_vertices, fs)
 img_cnn = plot_source_estimate(src=cnn_verts, t_max=t_max, fwd=fwd_vertices,fs=512, surfer_view=args.surfer_view)
+
+_, rap_verts = reg_to_verts_src(rap_output, n_vertices, region_mapping, fwd_vertices, fs)
+img_rap = plot_source_estimate(src=rap_verts, t_max=t_max, fwd=fwd_vertices,fs=512, surfer_view=args.surfer_view)
 
 _, mne_verts = reg_to_verts_src(mne_output, n_vertices, region_mapping, fwd_vertices, fs)
 _, slo_verts = reg_to_verts_src(slo_output, n_vertices, region_mapping, fwd_vertices, fs)
@@ -485,7 +536,7 @@ if args.show:
 else :
     plt.close()
 
-plot_src_from_imgs({"GT":img_gt, "4DVarNet": img_4dvar}, ["GT", "4DVarNet"])
+plot_src_from_imgs({"GT":img_gt, "Sparse MM-Net": img_4dvar}, ["GT", "Sparse MM-Net"])
 plt.savefig(Path(figs_path, f"cortex_only_res_idx_{idx}.png"), dpi=300, bbox_inches="tight")
 if args.show: 
     plt.show(block=False)
@@ -499,8 +550,8 @@ if args.show:
 else :
     plt.close()
 
-plot_src_from_imgs({"GT":img_gt, "4DVar": img_4dvar, "LSTM":img_lstm, "1DCNN":img_cnn, "MNE": img_mne, "sLORETA":img_slo}, 
-                   ["GT","4DVar", "LSTM", "1DCNN", "MNE", "sLORETA"])
+plot_src_from_imgs({"GT":img_gt, "4DVar": img_4dvar, "LSTM":img_lstm, "1DCNN":img_cnn, "MNE": img_mne, "sLORETA":img_slo, "RAP-MUSIC": img_rap}, 
+                   ["GT","4DVar", "LSTM", "1DCNN", "MNE", "sLORETA", "RAP-MUSIC"])
                    # subtitles=["\n0 -1"] + [f"\n{le:.3f} - {auc*100:.2f}" for le,auc in [(le_4dvar, auc_4dvar), (le_lstm, auc_lstm), (le_cnn, auc_cnn), (le_mne, auc_mne), (le_slo, auc_slo)]])
 # plot_src_from_imgs({"GT":img_gt, "4DVar": img_4dvar, "MNE": img_mne, "sLORETA":img_slo}, 
 #                    ["GT","4DVar", "MNE", "sLORETA"], 
@@ -512,54 +563,105 @@ if args.show:
 else :
     plt.close()
 
-plot_src_from_imgs({"MNE": img_mne, "sLORETA":img_slo}, ["MNE", "sLORETA"])
+plot_src_from_imgs({"MNE": img_mne, "sLORETA":img_slo, "RAP-MUSIC": img_rap}, ["MNE", "sLORETA", "RAP-MUSIC"])
 plt.savefig(Path(figs_path, f"cortex_nl_based_idx_{idx}.png"))
 if args.show: 
     plt.show(block=False)
 else :
     plt.close()
+    
+################################################################################################
+# Plot cortex for publication purposes
+
+method_name = "R-MM-Net"
+if args.publication:
+    plot_src_from_imgs({"GT": img_gt,}, ["GT",])
+    plt.savefig(Path(figs_path, f"cortex_gt_idx_{idx}.png"), dpi=300, bbox_inches="tight")
+    if args.show:
+        plt.show(block=False)
+    else:
+        plt.close()
+        
+    plot_src_from_imgs({"MNE": img_mne,}, ["MNE",])
+    plt.savefig(Path(figs_path, f"cortex_MNE_idx_{idx}.png"), dpi=300, bbox_inches="tight")
+    if args.show:
+        plt.show(block=False)
+    else:
+        plt.close()
+        
+    plot_src_from_imgs({"sLORETA":img_slo,}, ["sLORETA",])
+    plt.savefig(Path(figs_path, f"cortex_sLORETA_idx_{idx}.png"), dpi=300, bbox_inches="tight")
+    if args.show: 
+        plt.show(block=False)
+    else:
+        plt.close()
+
+    plot_src_from_imgs({f"{method_name}": img_4dvar,}, [f"{method_name}",])
+    plt.savefig(Path(figs_path, f"cortex_{method_name}_idx_{idx}.png"), dpi=300, bbox_inches="tight")
+    if args.show: 
+        plt.show(block=False)
+    else :
+        plt.close()
+################################################################################################
 
 #---
 ## Check the whole data as an image 
-plt.figure(figsize=(15,6)) 
-plt.subplot(161)
+plt.figure(figsize=(18,6)) 
+plt.subplot(171)
 plt.imshow(batch.tgt[idx_v,:,:].squeeze().numpy()) 
 plt.axis('off')
 plt.colorbar()
 plt.title('GT')
-plt.subplot(162)
+plt.subplot(172)
 plt.imshow(output[idx_v,:,:].squeeze().detach().numpy())
 plt.axis('off')
 plt.colorbar()
 plt.title('4DVar')
-plt.subplot(163)
+plt.subplot(173)
 plt.imshow(lstm_output[idx_v,:,:].squeeze().numpy())
 plt.axis('off')
 plt.colorbar()
 plt.title('LSTM')
-plt.subplot(164)
+plt.subplot(174)
 plt.imshow(cnn_output[idx_v,:,:].squeeze().detach().numpy())
 plt.axis('off')
 plt.colorbar()
 plt.title('1DCNN')
-plt.subplot(165)
+plt.subplot(175)
 plt.imshow(mne_output.squeeze())
 plt.axis('off')
 plt.colorbar()
 plt.title('MNE')
-plt.subplot(166)
+plt.subplot(176)
 plt.imshow(slo_output.squeeze())
 plt.axis('off')
 plt.colorbar()
 plt.title('sLORETA')
+plt.subplot(177)
+plt.imshow(rap_output.squeeze())
+plt.axis('off')
+plt.colorbar()
+plt.title('RAP-MUSIC')
 plt.savefig(Path(figs_path, f"source_2dt_idx_{idx}.png"))
 if args.show: 
     plt.show(block=False)
 else: 
     plt.close()
 
-## Variational cost during the gradient descent (and obs and prior cost separately)
+# Save the cost history in a txt file for later use
 varc = list(np.array(full_terms["data"]) + np.array(full_terms["reg"]))
+data_to_save = np.column_stack((
+    varc, 
+    full_terms["data"], 
+    full_terms["reg"]
+))
+txt_save_path = Path(figs_path, f"cost_history_idx_{idx}.txt")
+np.savetxt(txt_save_path, data_to_save, 
+           header="Total_Cost Data_Cost Reg_Cost", 
+           fmt='%.6f', 
+           comments='')
+
+## Variational cost during the gradient descent (and obs and prior cost separately)
 plt.figure(figsize=(15,5))
 plt.subplot(1,3,1)
 plt.plot(varc, '-', marker='o')
@@ -591,7 +693,8 @@ src_hat = {
     "LSTM": lstm_output[idx_v,:,:].numpy(),
     "1DCNN": cnn_output[idx_v,:,:].numpy(),
     "MNE": mne_output,
-    "sLORETA": slo_output
+    "sLORETA": slo_output,
+    "RAP-MUSIC": rap_output
 }
 
 fig, axes = plt.subplots(figsize=(16, 10), nrows=1, ncols=len(list(src_hat.keys())))
@@ -622,6 +725,8 @@ print(f"LSTM cossim: {coss(lstm_output, batch.tgt.detach()):.4f}")
 print(f"CNN cossim: {coss(cnn_output.detach(), batch.tgt.detach()):.4f}")
 print(f"MNE cossim: {coss(torch.from_numpy(mne_output).unsqueeze(0), batch.tgt.detach()):.4f}")
 print(f"sLO cossim: {coss(torch.from_numpy(slo_output).unsqueeze(0), batch.tgt.detach()):.4f}")
+print(f"RAP-MUSIC cossim: {coss(torch.from_numpy(rap_output).unsqueeze(0), batch.tgt.detach()):.4f}")
+
 
 ## obs cost
 print(f"GT obs cost: {coss( leadfield @ batch.tgt.detach() , batch.input.detach() ) }")
@@ -630,12 +735,15 @@ print(f"LSTM obs cost: {coss( leadfield @ lstm_output.detach() , batch.input.det
 print(f"CNN obs cost: {coss( leadfield @ cnn_output.detach() , batch.input.detach() ) }")
 print(f"MNE obs cost: {coss( leadfield @ torch.from_numpy(mne_output).unsqueeze(0).float() , batch.input.detach() ) }")
 print(f"sLO obs cost: {coss( leadfield @ torch.from_numpy(slo_output).unsqueeze(0).float() , batch.input.detach() ) }")
+print(f"RAP-MUSIC obs cost: {coss( leadfield @ torch.from_numpy(rap_output).unsqueeze(0).float() , batch.input.detach() ) }")
+
 ######### MSE 
 print(f"4DVAR nMSE: {met.nmse_fn(output.detach().squeeze(), batch.tgt.detach().squeeze())* 1e3:.4f}")
 print(f"LSTM nMSE: {met.nmse_fn(lstm_output.squeeze(), batch.tgt.detach().squeeze())* 1e3:.4f}")
 print(f"CNN nMSE: {met.nmse_fn(cnn_output.detach().squeeze(), batch.tgt.detach().squeeze())* 1e3:.4f}")
 print(f"MNE nMSE: {met.nmse_fn(torch.from_numpy(mne_output), batch.tgt.detach().squeeze())* 1e3:.4f}")
 print(f"sLO nMSE: {met.nmse_fn(torch.from_numpy(slo_output), batch.tgt.detach().squeeze())* 1e3:.4f}")
+print(f"RAP-MUSIC nMSE: {met.nmse_fn(torch.from_numpy(rap_output), batch.tgt.detach().squeeze())* 1e3:.4f}")
 
 ## obs cost
 print(f"GT obs cost nMSE: {met.nmse_fn( leadfield @ batch.tgt.detach().squeeze() , batch.input.detach().squeeze() ) * 1e3}")
@@ -644,6 +752,7 @@ print(f"LSTM obs cost nMSE: {met.nmse_fn( leadfield @ lstm_output.detach().squee
 print(f"CNN obs cost nMSE: {met.nmse_fn( leadfield @ cnn_output.detach().squeeze() , batch.input.detach().squeeze() ) * 1e3}")
 print(f"MNE obs cost nMSE: {met.nmse_fn( leadfield @ torch.from_numpy(mne_output).float() , batch.input.detach().squeeze() ) * 1e3}")
 print(f"sLO obs cost nMSE: {met.nmse_fn( leadfield @ torch.from_numpy(slo_output).float() , batch.input.detach().squeeze() ) * 1e3}")
+print(f"RAP-MUSIC obs cost nMSE: {met.nmse_fn( leadfield @ torch.from_numpy(rap_output).float() , batch.input.detach().squeeze() ) * 1e3}")
 
 #---
 
@@ -668,6 +777,8 @@ print(f"LSTM dice: {dice_metric(src_bin, lstm_output.squeeze()[:,t_eval], 0.2):.
 print(f"CNN dice: {dice_metric(src_bin, cnn_output.detach().squeeze()[:,t_eval], 0.2):.4f}")
 print(f"MNE dice: {dice_metric(src_bin, torch.from_numpy(mne_output).squeeze()[:,t_eval], 0.2):.4f}")
 print(f"sLORETA dice: {dice_metric(src_bin, torch.from_numpy(slo_output).squeeze()[:,t_eval], 0.2):.4f}")
+print(f"RAP-MUSIC dice: {dice_metric(src_bin, torch.from_numpy(rap_output).squeeze()[:,t_eval], 0.2):.4f}")
+
 
 
 #---

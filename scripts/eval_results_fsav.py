@@ -28,6 +28,7 @@ from torch import nn
 from tqdm import tqdm
 import sys 
 from scipy.io import loadmat
+import colorednoise
 
 print(f"Current working directory: {os.getcwd()}")
 
@@ -54,6 +55,10 @@ parser.add_argument("-mw", "--model_weight", type=str, help="model weight name",
 
 parser.add_argument("-test_ovr", "--test_overrides", nargs="*", help="test dataset overrides")
 parser.add_argument("-i", "--eval_idx", type=int, help="index of data for visualisation", default=2)
+parser.add_argument("-lfc", "--leadfield_conductivity", type=str, help="leadfield conductivity", default='1:50')
+parser.add_argument("-nsnr", "--noise_snr", type=int, help="noise signal-to-noise ratio", default=5)
+parser.add_argument("-nt", "--noise_type", type=str, help="type of noise to add", default="white")
+
 parser.add_argument("-sv", "--surfer_view", type=str, default="lat", help="surfer view if different from the one in the default file")
 parser.add_argument("-sh", "--show", action="store_true")
 parser.add_argument("-tdc", "--test_data_config", type=str, help="test dataset config file", default='test_ses_sereega_fsav994_125ms.yaml')
@@ -67,8 +72,9 @@ parser.add_argument("-sub", "--subset_name", type=str, default="left_back", help
 
 args = parser.parse_args()
 
-
-pl.seed_everything(333)
+seed = 333
+pl.seed_everything(seed)
+pink_noise_rng = np.random.default_rng(seed)
 device = torch.device("cpu")
 
 overlap=args.overlap
@@ -139,18 +145,29 @@ else :
 dm.setup("test")
 test_dl = dm.test_dataloader()
 n_times = next(iter(test_dl))[0].shape[2]
-fwd = hydra.utils.call(cfg.fwd)
-# mne_info = hydra.utils.call(cfg.mne_info)
-leadfield = torch.from_numpy(fwd['sol']['data']).float()
 
 #---------------- load forward model objects and leadfield -------------------------# 
 fwd = hydra.utils.call(cfg.fwd)
 # mne_info = hydra.utils.call(cfg.mne_info)
-leadfield = torch.from_numpy(fwd['sol']['data']).float()
+
+model_folder = Path( f"{test_config.datafolder}/{test_config.subject_name}/{test_config.orientation}/{test_config.electrode_montage}/{test_config.source_sampling}/model" )
+
+# Load a different leadfield
+if args.leadfield_conductivity != "1:50":
+    # Load a different leadfield
+    leadfield_conductivity_list = ["1:20", "1:50", "1:80"]
+    if args.leadfield_conductivity not in leadfield_conductivity_list:
+        print(f"Leadfield conductivity {args.leadfield_conductivity} not supported. Please choose from {leadfield_conductivity_list}")
+        sys.exit()
+    mat_data = loadmat(f'{model_folder}/LF_fsav_994_{args.leadfield_conductivity}.mat')
+    leadfield = torch.from_numpy(mat_data['G']).float()
+else:
+    leadfield = torch.from_numpy(fwd['sol']['data']).float()
+args.leadfield_conductivity = args.leadfield_conductivity.replace(":", "")
+fwd['sol']['data'] = leadfield.detach().clone().numpy()
 
 ### load vertices data to view source ###
 ### load the 2 source spaces and region mapping
-model_folder = Path( f"{test_config.datafolder}/{test_config.subject_name}/{test_config.orientation}/{test_config.electrode_montage}/{test_config.source_sampling}/model" )
 fwd_vertices = mne.read_forward_solution(
     f"{model_folder}/fwd_verticesfsav_994-fwd.fif"
 )
@@ -214,6 +231,12 @@ fs = np.floor(mne_info['sfreq'])
 t_vec = np.arange(0, n_times / fs, 1 / fs)
 spos = torch.from_numpy(fwd['source_rr'])
 
+# Sensor Positions
+n_val_samples = len(dm.test_ds)
+eeg_picks = mne.pick_types(mne_info, eeg=True, meg=False)
+sensor_pos_np = np.array([mne_info['chs'][idx]['loc'][:3] for idx in eeg_picks])
+sensor_pos = torch.from_numpy(sensor_pos_np).float()
+min_dist_array = np.zeros(n_val_samples)
 
 if test_config.source_sampling == "fsav_994": 
     neighbors = np.squeeze( loadmat(f"{anatomy_folder}/fs_cortex_20k_region_mapping.mat")['nbs'] )
@@ -240,10 +263,9 @@ linear_methods = ["MNE", "sLORETA"]
 # nn_methods = ["4dvar"] + baselines
 # methods = ["gt"] + nn_methods + linear_methods 
 nn_methods = baselines + ["4dvar"]
-methods = ["gt"] + linear_methods + nn_methods
+methods = ["gt"] + linear_methods + ["RAP-MUSIC"] + nn_methods
 # methods = ["gt"] + [args.method]
 ##### eval #####
-n_val_samples = len(dm.test_ds)
 # nmse_dict = {method: np.zeros((n_val_samples, 1)) for method in methods}
 # loc_error_dict = {method: np.zeros((n_val_samples, 1)) for method in methods}
 # psnr_dict = {method: np.zeros((n_val_samples, 1)) for method in methods}
@@ -255,6 +277,8 @@ loc_error_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
 psnr_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
 time_error_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
 auc_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
+reg_mae_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
+shape_error_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
 cosine_sim_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
 inference_time_dict = {method: np.empty((n_val_samples, 1)) for method in methods}
 
@@ -264,6 +288,27 @@ coss = CosineSimilarityFlatLoss()
 for k in tqdm(range(n_val_samples)):
     eeg_gt, src_gt = dm.test_ds[k]
     eeg_gt, src_gt = eeg_gt.float().clone(), src_gt.float().clone()
+
+    # Change leadfield
+    eeg_gt = leadfield @ src_gt
+    
+    num_elec, num_time = eeg_gt.shape
+    sig_power = torch.square(torch.linalg.norm(eeg_gt, dim=1)) / num_time
+    noise_power = (10 ** (-(args.noise_snr / 10))) * sig_power / 2
+    noise_std = torch.sqrt(noise_power)
+    if args.noise_type == "white":
+        noise_distribution = torch.randn_like(eeg_gt)
+
+    elif args.noise_type == "pink":
+        # Generate colored noise using the 'powerlaw' method
+        noise_distribution = torch.from_numpy(
+            colorednoise.powerlaw_psd_gaussian(1,
+                                               size=(num_elec, num_time),
+                                               random_state=pink_noise_rng,)
+        ).float().to(eeg_gt.device)
+    
+    noise_matrix = noise_distribution * noise_std[:, None]
+    eeg_gt = eeg_gt + noise_matrix.detach().clone()
 
     eeg_gt_unscaled = eeg_gt.clone() * dm.test_ds.max_eeg[k]
     src_gt_unscaled = src_gt.clone() * dm.test_ds.max_src[k]
@@ -305,7 +350,31 @@ for k in tqdm(range(n_val_samples)):
                 raw=raw_eeg, inverse_operator=inv_op, lambda2=lambda2, method=m, verbose=False
             )
             stc_hat[m] = stc_hat[m].data
-        
+        elif m in "RAP-MUSIC":
+            evoked_eeg = mne.EvokedArray(raw_eeg.get_data(), raw_eeg.info, tmin=raw_eeg.times[0])
+
+            n_dipoles = dm.test_ds.md[k]['n_patch']
+
+            dipoles = mne.beamformer.rap_music(
+                evoked=evoked_eeg,
+                forward=fwd,
+                noise_cov=noise_cov,
+                n_dipoles=n_dipoles,
+                verbose=False
+            )
+
+            n_sources = fwd['source_rr'].shape[0]
+            n_times = raw_eeg.n_times
+            stc_rap = np.zeros((n_sources, n_times))
+
+            for dip in dipoles:
+                distances = np.linalg.norm(fwd['source_rr'] - dip.pos[0], axis=1)
+                best_idx = np.argmin(distances)
+                
+                stc_rap[best_idx, :] += np.squeeze(dip.amplitude)
+
+            stc_hat[m] = stc_rap
+
         elif m in baselines : 
             with torch.no_grad():
                 batch = TrainingItem(
@@ -349,6 +418,7 @@ for k in tqdm(range(n_val_samples)):
                     output, inner_losses, full_terms = litmodel.l2o(batch.tgt, batch.input, return_all=True)
                     output = output.detach()
                     output_ae = litmodel.l2o.reg_net(output)
+                    #output_ae = litmodel.l2o.update_rule.subgradient_prior_net(output)
                     
                     # output = torch.matmul(litmodel(batch), batch.input).detach()
                     # output_ae = torch.matmul(litmodel.solver.prior_cost.forward_ae( litmodel(batch)), batch.input)
@@ -363,7 +433,9 @@ for k in tqdm(range(n_val_samples)):
         te = 0
         nmse = 0
         auc_val = 0
-        
+        reg_mae = 0
+        shape_error = 0
+
         seeds_hat = []
         ## check for overlap ------ @TODO : fix ok for 2 sources, not for more
         seeds = dm.test_ds.md[k]["seeds"]
@@ -412,14 +484,40 @@ for k in tqdm(range(n_val_samples)):
                 src_gt_unscaled[:,t_eval_gt] / src_gt_unscaled[:,t_eval_gt].abs().max() - src_hat[:,t_eval_gt] / src_hat[:,t_eval_gt].abs().max() 
                 )**2 ).mean()
             nmse += nmse_tmp
-                
+            
+            # Spatial Aggregation: Compress the ROI into a single 1D temporal waveform
+            wave_gt = src_gt_unscaled[eval_zone, :].abs().sum(dim=0)
+            wave_pred = src_hat[eval_zone, :].abs().sum(dim=0)
+
+            # Regional Waveform MAE
+            # Evaluates the conservation of absolute physiological signal mass/amplitude.
+            reg_mae_tmp = (wave_gt - wave_pred).abs().mean()
+            # reg_nmae_tmp = (reg_mae_tmp / wave_gt.mean()).item() * 100.0
+            reg_mae += reg_mae_tmp.item()
+
+            # Waveform Shape Error
+            # Evaluates the fidelity of temporal dynamics (phase and morphology), independent of scale.
+            shape_error_tmp = nn.functional.cosine_similarity(wave_gt.unsqueeze(0), wave_pred.unsqueeze(0))
+            shape_error_tmp = 1.0 - shape_error_tmp.item()
+            shape_error += shape_error_tmp
             seeds_hat.append(s_hat)
 
         le = le / len(seeds)
         te = te / len(seeds)
         nmse = nmse / len(seeds)
         auc_val = auc_val / len(seeds)
+        reg_mae = reg_mae / len(seeds)
+        shape_error = shape_error / len(seeds)
         tmaxs_pred = torch.argmax(src_hat[seeds_hat, :].abs(), dim=1)
+
+        # Min dist error - deep source localisation error
+        if m == methods[0]: 
+            mdist_sum = 0
+            for s_true in seeds:
+                dist_to_sensors = torch.sqrt(((sensor_pos - spos[s_true, :]) ** 2).sum(dim=1))
+                mdist_sum += dist_to_sensors.min().item()
+            min_dist_array[k] = (mdist_sum / len(seeds)) * 1000
+
         # time error (error on the instant of the max. activity):
         time_error_dict[m][k] = te
         # print(f"time error: {time_error*1e3} [ms]")
@@ -451,16 +549,19 @@ for k in tqdm(range(n_val_samples)):
         # cosine similarity
         cosine_sim_dict[m][k] = coss( src_gt_unscaled.unsqueeze(0), src_hat.unsqueeze(0))
 
+        reg_mae_dict[m][k] = reg_mae
+        shape_error_dict[m][k] = shape_error
+
         # change plots to visu. multiple sources
         idx_max_gt = seeds[0]
         idx_max_pred = seeds_hat[0]
 
 
-    for k, v in full_terms.items():
-        full_terms[k] = np.array(v).mean()
-    rows = np.array([full_terms['data'] + full_terms['reg'], full_terms['data'], full_terms['reg']])
-with open(Path(output_dir, "Lower_Cost.csv"), "w+") as f:
-    np.savetxt(Path(output_dir, "Lower_Cost.csv"), rows, delimiter=",", fmt='%.15f')
+#     for k, v in full_terms.items():
+#         full_terms[k] = np.array(v).mean()
+#     rows = np.array([full_terms['data'] + full_terms['reg'], full_terms['data'], full_terms['reg']])
+# with open(Path(output_dir, "Lower_Cost.csv"), "w+") as f:
+#     np.savetxt(Path(output_dir, "Lower_Cost.csv"), rows, delimiter=",", fmt='%.15f')
 
 #####################################################################
 #############################################################################
@@ -473,8 +574,10 @@ metrics = {
     "LE":loc_error_dict, 
     "nMSE":nmse_dict, 
     "AUC":auc_dict, 
-    "PSNR":psnr_dict, 
+    "PSNR":psnr_dict,
     "TE":time_error_dict,
+    "RMAE":reg_mae_dict,
+    "SE":shape_error_dict,
     "IT":inference_time_dict
     }
 for me in metrics :
@@ -482,8 +585,7 @@ for me in metrics :
     df = pd.DataFrame(data = list_of_arrays).T
     df.columns = list(metrics[me].keys())
 
-    df.to_csv(Path(output_dir, "evals", "test", args.test_data_config,  f"{me.upper()}.csv"), index=False)
-
+    df.to_csv(Path(output_dir, "evals", "test", args.test_data_config, f"{me.upper()}_{args.leadfield_conductivity}_{args.noise_type}_{args.noise_snr}.csv"), index=False)
  
 # save mean and std value
 data = {
@@ -495,7 +597,7 @@ for method in methods:
 )
 df = pd.DataFrame(data=data)
 df = df.set_index('metric')
-df.to_csv(Path(output_dir, "evals", "test",args.test_data_config, "MEANS.csv"), float_format='%.4f')
+df.to_csv(Path(output_dir, "evals", "test",args.test_data_config, f"MEANS_{args.leadfield_conductivity}_{args.noise_type}_{args.noise_snr}.csv"), float_format='%.4f')
 ## std
 data = {
     'metric': list(metrics.keys())
@@ -506,7 +608,7 @@ for method in methods:
 )
 df = pd.DataFrame(data=data)
 df = df.set_index('metric')
-df.to_csv(Path(output_dir, "evals", "test", args.test_data_config, "STDS.csv"), float_format='%.4f')
+df.to_csv(Path(output_dir, "evals", "test", args.test_data_config, f"STDS_{args.leadfield_conductivity}_{args.noise_type}_{args.noise_snr}.csv"), float_format='%.4f')
 
 for method in methods:
     print(f" >>>>>>>>>>>>>>> Results method {method} <<<<<<<<<<<<<<<<<<<<<<<<<<")
@@ -515,5 +617,63 @@ for method in methods:
     print(f"mean nmse at instant of max activity: {nmse_dict[method].mean():.4f}")
     print(f"psnr for total source distrib: {psnr_dict[method].mean():.4f} [dB]")
     print(f"mean time error: {time_error_dict[method].mean()*1e3} [ms]")
+    print(f"mean regional mae: {reg_mae_dict[method].mean():.4f}")
+    print(f"mean shape error: {shape_error_dict[method].mean():.4f}")
     print(f"avg inference time: {inference_time_dict[method].mean()} [s]")
+
+## Plot Depth Bias
+plt.figure(figsize=(10, 7))
+colormap = plt.cm.get_cmap('tab10')
+
+# Dictionary to store slope and intercept for later comparison
+trendline_coeffs = {}
+
+for idx, method in enumerate(methods):
+    if method == "gt": 
+        continue # Skip ground truth since LE is always 0
     
+    # Get LE data for the current method, reshape to 1D array
+    le_data = loc_error_dict[method].squeeze()
+    
+    color = colormap(idx % 10)
+    
+    # Scatter plot with reduced opacity and size to minimize clutter
+    plt.scatter(min_dist_array, le_data, label=method, alpha=0.2, s=15, color=color, edgecolors='none')
+    
+    # Calculate and plot the trendline (1st-degree polynomial)
+    z = np.polyfit(min_dist_array, le_data, 1)
+    p = np.poly1d(z)
+    plt.plot(min_dist_array, p(min_dist_array), linestyle="--", linewidth=2, color=color)
+    
+    # Save coefficients (z[0] = slope, z[1] = intercept)
+    trendline_coeffs[method] = {'slope': z[0], 'intercept': z[1]}
+
+# Plot configuration
+plt.axhline(y=0, color='black', linestyle='-', linewidth=2, label="Ideal (LE = 0)")
+plt.title('Depth Bias Evaluation of Inverse Solvers', fontsize=14, fontweight='bold', pad=15)
+plt.xlabel('Distance from True Source to Closest Electrode (mm)', fontsize=12)
+plt.ylabel('Localization Error - LE (mm)', fontsize=12)
+plt.grid(True, linestyle=':', alpha=0.7)
+
+lgnd = plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11)
+for handle in lgnd.legend_handles:
+    handle.set_alpha(1.0)
+    if hasattr(handle, 'set_sizes'):
+        handle.set_sizes([40])
+
+plt.tight_layout()
+
+# Save plot
+eval_dir = Path(output_dir, "evals", "test", args.test_data_config)
+os.makedirs(eval_dir, exist_ok=True)
+plot_save_path = Path(eval_dir, "Depth_Bias_Plot.png")
+plt.savefig(plot_save_path, dpi=300)
+print(f"\n[INFO] Saved Depth Bias plot at: {plot_save_path}")
+
+# Save trendline coefficients to CSV
+coeffs_df = pd.DataFrame.from_dict(trendline_coeffs, orient='index')
+coeffs_df.to_csv(Path(eval_dir, "Trendline_Coeffs.csv"))
+print(f"[INFO] Saved trendline coefficients at: {Path(eval_dir, 'Trendline_Coeffs.csv')}")
+
+if args.show:
+    plt.show()

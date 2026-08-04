@@ -1,5 +1,4 @@
-#_target_: models.autoencoder.LConv1DAE
-_target_: models.autoencoder.Conv1DAE
+_target_: models.autoencoder.NonexpansiveConv1DAE
 dim_in: ${dataset.n_sources}
 dim_hidden: 128
 dim_out: ${dataset.n_sources}
