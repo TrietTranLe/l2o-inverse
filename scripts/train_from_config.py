@@ -1,7 +1,8 @@
 import os
+import select
 import hydra
 import pytorch_lightning as pl
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 import time
 import torch
@@ -11,7 +12,8 @@ os.environ['HYDRA_FULL_ERROR'] = "1"
 @hydra.main(config_path="../configs", config_name="config_fsav994", version_base=None)
 def main(cfg:DictConfig):
     torch.cuda.empty_cache()
-    pl.seed_everything(333) # seed for reproducibility
+    seed = OmegaConf.select(cfg, "seed", default=333)
+    pl.seed_everything(seed, workers=True) # seed for reproducibility
 
     ## DATA ##
     dm = hydra.utils.call(cfg.datamodule)
