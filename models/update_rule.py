@@ -1,5 +1,4 @@
-from math import tau
-
+import math
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
@@ -1102,3 +1101,108 @@ class S_MM_UR_2(BaseUR):
             return P
         else:
             raise ValueError(f"Invalid mode: {mode}")
+        
+
+class S_MM_UR_3(BaseUR):
+    """
+    A stochastic-majorization-minimization (MM) update rule.
+    """
+    def __init__(self, temperature: float = 1.0, eps=1e-8, D_mode="Const"):
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+        self.D_mode = D_mode
+
+    def forward(self, E, x, grad, lambda_max, step, step_num):
+        """
+        Args:
+            x        : current state (Tensor)
+            grad     : tuple (P_grad, P, grad_E) from grad_mod
+            P        : diagonal majorant matrix (Tensor, same shape as x)
+            step     : int, step index
+            step_num : int, total number of steps
+        """
+        P_grad, P, grad_E = grad  # grad is a tuple (P_grad, P, grad_E)
+        
+        mu = -P_grad  # Descent direction
+        if self.temperature != 0.0:
+            D = self._compute_D(x, E, mu, P, grad_E, lambda_max, step, step_num)
+            noise = torch.sqrt(2*D) * torch.randn_like(x)
+            return x + mu + noise
+        else:
+            return x + mu  # Deterministic step without noise
+
+
+    def _compute_D(self, x, E, mu, P, grad, lambda_max, step, step_num):
+        """ Compute a diagonal matrix D based on P, grad, and step."""
+        reduce_dims = tuple(range(1, P.ndim))
+        if self.D_mode == "Const":
+            if step == 0:
+                self.mem_dict = {}
+                D0 = self.temperature * P.mean(dim=reduce_dims, keepdim=True)
+                self.mem_dict["D0"] = D0
+                self.mem_dict["D"] = D0
+            return self.mem_dict["D"]
+
+        elif self.D_mode == "CosineAnnealing":
+            if step == 0:
+                self.mem_dict = {}
+                D0 = self.temperature * P.mean(dim=reduce_dims, keepdim=True)
+                self.mem_dict["D0"] = D0
+
+            eta_t = 0.5 * (1.0 + math.cos(step / max(step_num - 1, 1) * math.pi))
+            D_floor = self.temperature * self.eps
+            self.mem_dict["D"] = D_floor + eta_t * (self.mem_dict["D0"] - D_floor)
+            return self.mem_dict["D"]
+
+        elif self.D_mode == "Frozen":
+            if step == 0:
+                self.mem_dict = {}
+                self.mem_dict['D'] = self.temperature * P.clone()
+            return self.mem_dict['D']
+
+        elif self.D_mode == "Preconditioner":
+            return self.temperature * P.clone()
+
+        elif self.D_mode == "IsotropicGGD" or self.D_mode == "GGD":
+            D = self._compute_D_trapezoidal(x, E, mu, P, grad, lambda_max, step)
+            if self.D_mode == "IsotropicGGD":
+                return D.mean(dim=reduce_dims, keepdim=True)
+            else:
+                return D
+        else:
+            raise ValueError(f"Invalid D_mode: {self.D_mode}")
+
+    def _compute_D_trapezoidal(self, x, E, mu, P, grad, lambda_max, step):
+        """ Compute a diagonal matrix D based on P, grad, and step."""
+        if step == 0:
+            self.mem_dict = {}
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+            self.mem_dict['D'] = self.temperature * P.clone()
+
+            self.mem_dict['E'] = E.clone()
+            self.mem_dict['E_0'] = E.clone()
+            self.mem_dict['P_0'] = P.clone()
+        else:
+            delta_x = x - self.mem_dict['x']
+            delta_E = E - self.mem_dict['E']
+
+            exponent = torch.clamp(delta_E / self.temperature, max=50.0) # Avoid explosions
+            self.mem_dict['D'] = (self.mem_dict['D'] + delta_x*self.mem_dict['mu']/2)*torch.exp(exponent) + delta_x*mu/2
+            
+            D_cap = self._compute_diffusion_upper_bound(E)
+            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], max=D_cap)
+
+            D_floor = self.temperature * self.eps
+            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=D_floor)
+
+            # Update stored values for next step (backward-looking)
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+            self.mem_dict['E'] = E.clone()
+        return self.mem_dict['D']
+
+    def _compute_diffusion_upper_bound(self, E):
+        return self.temperature * self.mem_dict['P_0'] * torch.exp(torch.clamp((E - self.mem_dict['E_0']) / self.temperature, max=50.0))
+        

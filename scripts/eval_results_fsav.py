@@ -30,8 +30,6 @@ import sys
 from scipy.io import loadmat
 import colorednoise
 
-print(f"Current working directory: {os.getcwd()}")
-
 import data.eeg.utils_eeg as utl
 from . import metrics as met
 from data.eeg.data import EsiDatamodule
@@ -56,6 +54,8 @@ parser.add_argument("-mw", "--model_weight", type=str, help="model weight name",
 parser.add_argument("-test_ovr", "--test_overrides", nargs="*", help="test dataset overrides")
 parser.add_argument("-i", "--eval_idx", type=int, help="index of data for visualisation", default=2)
 parser.add_argument("-lfc", "--leadfield_conductivity", type=str, help="leadfield conductivity", default='1:50')
+parser.add_argument("-lfm", "--leadfield_mismatch", action="store_true", help="leadfield mismatch")
+parser.add_argument("-lldm", "--leadfield_loss_data_mismatch", action="store_true", help="leadfield mismatch between data and inner loss function")
 parser.add_argument("-nsnr", "--noise_snr", type=int, help="noise signal-to-noise ratio", default=5)
 parser.add_argument("-nt", "--noise_type", type=str, help="type of noise to add", default="white")
 
@@ -84,7 +84,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 output_dir = Path(ROOT, args.output_dir)
 config_path = Path(output_dir, ".hydra")
-print(config_path)
 #overrides_name = Path("overrides.yaml")
 ## load the overrides file
 #overr = OmegaConf.load(Path(config_path, overrides_name))
@@ -153,18 +152,31 @@ fwd = hydra.utils.call(cfg.fwd)
 model_folder = Path( f"{test_config.datafolder}/{test_config.subject_name}/{test_config.orientation}/{test_config.electrode_montage}/{test_config.source_sampling}/model" )
 
 # Load a different leadfield
+leadfield_conductivity_list = ["1:20", "1:50", "1:80"]
+if args.leadfield_conductivity not in leadfield_conductivity_list:
+    print(f"Leadfield conductivity {args.leadfield_conductivity} not supported. Please choose from {leadfield_conductivity_list}")
+    sys.exit()
+
 if args.leadfield_conductivity != "1:50":
-    # Load a different leadfield
-    leadfield_conductivity_list = ["1:20", "1:50", "1:80"]
-    if args.leadfield_conductivity not in leadfield_conductivity_list:
-        print(f"Leadfield conductivity {args.leadfield_conductivity} not supported. Please choose from {leadfield_conductivity_list}")
-        sys.exit()
     mat_data = loadmat(f'{model_folder}/LF_fsav_994_{args.leadfield_conductivity}.mat')
     leadfield = torch.from_numpy(mat_data['G']).float()
 else:
     leadfield = torch.from_numpy(fwd['sol']['data']).float()
-args.leadfield_conductivity = args.leadfield_conductivity.replace(":", "")
+
 fwd['sol']['data'] = leadfield.detach().clone().numpy()
+
+if not args.leadfield_mismatch and args.leadfield_conductivity != "1:50":
+    if args.leadfield_loss_data_mismatch:
+        if args.leadfield_conductivity == "1:20":
+            print(f"Leadfield mismatch between data and inner loss function is set to True. Using the 1:80 leadfield for the inner loss function.")
+            cfg.loss.inner_loss.L.forward_obj = f'{model_folder}/LF_fsav_994_1:80.mat'
+        elif args.leadfield_conductivity == "1:80":
+            print(f"Leadfield mismatch between data and inner loss function is set to True. Using the 1:20 leadfield for the inner loss function.")
+            cfg.loss.inner_loss.L.forward_obj = f'{model_folder}/LF_fsav_994_1:20.mat'
+    else:
+        print(f"Leadfield mismatch is set to False. Using the same leadfield as the one used for generating evaluation data.")
+        cfg.loss.inner_loss.L.forward_obj = f'{model_folder}/LF_fsav_994_{args.leadfield_conductivity}.mat'
+args.leadfield_conductivity = args.leadfield_conductivity.replace(":", "")
 
 ### load vertices data to view source ###
 ### load the 2 source spaces and region mapping
@@ -213,8 +225,8 @@ baseline_config_path = args.baseline_config
 if baselines :
     baseline_nets = dict(zip(baselines, []*len(baselines)))
     baseline_config = OmegaConf.load(str(Path(ROOT, "configs", "baselines", baseline_config_path)))
-    # baseline_config =  OmegaConf.load(args.baseline_config)
-    for bsl in baselines: 
+    # baseline_config = OmegaConf.load(args.baseline_config)
+    for bsl in baselines:
         baseline_nets[bsl] = load_model_from_conf(bsl, baseline_config)
 else : 
     baselines = []
