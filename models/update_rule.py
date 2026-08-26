@@ -1170,6 +1170,8 @@ class S_MM_UR_3(BaseUR):
                 return D.mean(dim=reduce_dims, keepdim=True)
             else:
                 return D
+        elif self.D_mode == "ScalarGGD":
+            return self._compute_D_trapezoidal_scalar(x, E, mu, P, grad, lambda_max, step)
         else:
             raise ValueError(f"Invalid D_mode: {self.D_mode}")
 
@@ -1194,15 +1196,52 @@ class S_MM_UR_3(BaseUR):
             D_cap = self._compute_diffusion_upper_bound(E)
             self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], max=D_cap)
 
-            D_floor = self.temperature * self.eps
-            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=D_floor)
+            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=0.0)
+
+            # D_floor = self.temperature * self.eps
+            # self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=D_floor)
 
             # Update stored values for next step (backward-looking)
             self.mem_dict['x'] = x.clone()
             self.mem_dict['mu'] = mu.clone()
             self.mem_dict['E'] = E.clone()
-        return self.mem_dict['D']
+        return torch.clamp(self.mem_dict['D'], min=self.temperature * self.eps)
 
     def _compute_diffusion_upper_bound(self, E):
         return self.temperature * self.mem_dict['P_0'] * torch.exp(torch.clamp((E - self.mem_dict['E_0']) / self.temperature, max=50.0))
-        
+
+    def _compute_D_trapezoidal_scalar(self, x, E, mu, P, grad, lambda_max, step):
+        """ Compute a diagonal matrix D based on P, grad, and step."""
+        reduce_dims = tuple(range(1, P.ndim))
+        if step == 0:
+            self.mem_dict = {}
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+            self.mem_dict['D'] = self.temperature * P.mean(dim=reduce_dims, keepdim=True)
+            self.mem_dict['D_0'] = self.mem_dict['D'].clone()
+
+            self.mem_dict['E'] = E.clone()
+            self.mem_dict['E_0'] = E.clone()
+        else:
+            delta_x = x - self.mem_dict['x']
+            delta_E = E - self.mem_dict['E']
+
+            exponent = torch.clamp(delta_E / self.temperature, max=50.0) # Avoid explosions
+            self.mem_dict['D'] = (self.mem_dict['D'] + (delta_x * self.mem_dict['mu']).sum(dim=reduce_dims, keepdim=True)/2)*torch.exp(exponent) + (delta_x * mu).sum(dim=reduce_dims, keepdim=True)/2
+            
+            D_cap = self._compute_diffusion_upper_bound_scalar(E)
+            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], max=D_cap)
+
+            self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=0.0)
+
+            # D_floor = self.temperature * self.eps
+            # self.mem_dict['D'] = torch.clamp(self.mem_dict['D'], min=D_floor)
+
+            # Update stored values for next step (backward-looking)
+            self.mem_dict['x'] = x.clone()
+            self.mem_dict['mu'] = mu.clone()
+            self.mem_dict['E'] = E.clone()
+        return torch.clamp(self.mem_dict['D'], min=self.temperature * self.eps)
+
+    def _compute_diffusion_upper_bound_scalar(self, E):
+        return self.mem_dict['D_0'] * torch.exp(torch.clamp((E - self.mem_dict['E_0']) / self.temperature, max=50.0))
