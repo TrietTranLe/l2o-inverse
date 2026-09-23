@@ -1245,3 +1245,450 @@ class S_MM_UR_3(BaseUR):
 
     def _compute_diffusion_upper_bound_scalar(self, E):
         return self.mem_dict['D_0'] * torch.exp(torch.clamp((E - self.mem_dict['E_0']) / self.temperature, max=50.0))
+
+
+class S_MM_UR_BESQ_qexp(BaseUR):
+    """
+    A stochastic update rule based on
+        Target distribution: normalized q-exponential psi(E), so that psi(E_0) = 1, where p = q - 1.
+        Reparameterized variable: Q = D * psi(E).
+        Euler approx -> Exact BESQ^2 -> BESQ^delta.
+    """
+    def __init__(self, target_scale: float = 1.0, p: float = 0.5, delta: float = 2.0, stochastic: bool = True, eps: float = 1e-8):
+        super().__init__()
+        self.target_scale = target_scale
+        self.p = p
+        self.delta = float(delta)
+        self.stochastic = stochastic
+        self.eps = eps
+
+    def forward(self, E, x, grad, lambda_max, step, step_num):
+        """
+        Args:
+            x        : current state (Tensor)
+            grad     : tuple (P_grad, P, grad_E) from grad_mod
+            P        : diagonal majorant matrix (Tensor, same shape as x)
+            step     : int, step index
+            step_num : int, total number of steps
+        """
+        P_grad, P, grad_E = grad  # grad is a tuple (P_grad, P, grad_E)
+        mu = -P_grad  # Descent direction
+
+        if self.stochastic:
+            xi = torch.randn_like(x)
+            noise_scale = self._compute_noise_scale(E, mu, P, xi, step)
+            noise = noise_scale * xi
+            return x + mu + noise
+        else:
+            return x + mu  # Deterministic step without noise
+
+    # def _log_target_weight(self, E):
+    #     """
+    #     log w_p(E)
+
+    #     p = 0:
+    #         log w = -E/tau
+
+    #     p > 0:
+    #         log w = -(1/p) log(1 + p E/tau)
+    #     """
+    #     if self.p < 0.0:
+    #         raise ValueError(
+    #             f"p must be >= 0, got p={self.p}"
+    #         )
+
+    #     if self.p == 0.0:
+    #         return -E / self.target_scale
+
+    #     return -torch.log1p(self.p * E / self.target_scale)/ self.p
+
+    def _log_psi(self, E, E0):
+        """
+        Scale-free normalized q-exponential:
+
+            psi_p(E; E0)
+            = [1 + p(E/E0 - 1)]^(-1/p)
+
+        Gibbs limit p -> 0:
+
+            psi_0(E; E0)
+            = exp(-(E/E0 - 1))
+
+        Hence:
+            psi(E0) = 1
+            -d log psi / dE | E0 = 1/E0
+            D0 = E0 * P
+        """
+        p = float(self.p)
+
+        if not (0.0 <= p < 1.0):
+            raise ValueError(
+                f"p must satisfy 0 <= p < 1, got p={p}"
+            )
+
+        if torch.any(E0 <= 0):
+            raise RuntimeError(
+                "Scale-free target requires E0 > 0."
+            )
+
+        u = E / E0 - 1.0
+
+        if p == 0.0:
+            return -u
+
+        base = 1.0 + p * u
+
+        if torch.any(base <= 0):
+            raise RuntimeError(
+                "q-exponential base became non-positive."
+            )
+
+        return -torch.log1p(p * u) / p
+
+    def _compute_noise_scale(self, E, mu, P, xi, step):
+        """ Compute the noise scale based on BESQ.
+        
+        General theory:
+            Q_k = D_k * psi_k
+            A_k = psi_k * mu_k^2
+
+        Exact BESQ:
+            Q_{k+1} ~ A_k/2 * chi'^2_delta(2 * Q_k / A_k)
+        """
+        # log_w = self._log_target_weight(E)
+
+        if step == 0:
+            self.mem_dict = {}
+            # self.mem_dict["log_w0"] = log_w.detach().clone()
+
+            self.mem_dict["E0"] = E.detach().clone()
+
+        # Compute psi in log-domain
+        # log_psi = log_w - self.mem_dict["log_w0"]
+        log_psi = self._log_psi(E, self.mem_dict["E0"])
+
+        if step == 0:
+            c_k = log_psi.detach().clone()
+            # R_k = (self.target_scale + self.p * E.clone()) * P.clone()
+            # R_k = self.mem_dict["E0"] * P.clone()
+            R_k = torch.zeros_like(P)
+        else:
+            c_prev = self.mem_dict['c']
+            c_k = torch.maximum(c_prev, log_psi.detach())
+            R_k = self.mem_dict['R'] * torch.exp(c_prev - c_k)
+
+        # Compute sqrt(2*D_k) directly in log-domain
+        noise_scale = self._safe_noise_scale(R_k, c_k, log_psi, step)
+
+        # BESQ transition
+        psi_scaled = torch.exp(log_psi - c_k)
+        A_bar = psi_scaled * mu**2
+        is_positive_integer_delta = (self.delta > 0.0 and self.delta.is_integer())
+        if is_positive_integer_delta:
+            self.mem_dict['R'] = self._besq_delta_integer(R_k=R_k, A_bar=A_bar, mu=mu, xi=xi, psi_scaled=psi_scaled)
+        elif self.delta >= 0.0:
+            self.mem_dict['R'] = self._besq_delta_noninteger(R_k=R_k, A_bar=A_bar, mu=mu, xi=xi, psi_scaled=psi_scaled)
+        else:
+            raise ValueError(f"delta must be >= 0, got {self.delta}")
+
+        self.mem_dict['c'] = c_k
+
+        # ratio = A_bar / torch.clamp(
+        #     R_k,
+        #     min=torch.finfo(R_k.dtype).tiny
+        # )
+        # print(
+        #     f"step={step} | "
+        #     f"mu={mu.norm().item():.4e} | "
+        #     f"noise_scale={noise_scale.norm().item():.4e} | "
+        #     f"R={R_k.norm().item():.4e} | "
+        #     f"A={A_bar.norm().item():.4e} | "
+        #     f"psi={torch.exp(log_psi).mean().item():.4e} |"
+        #     f"A/R median={ratio.median().item():.3e} | "
+        #     f"A/R mean={ratio.mean().item():.3e} | "
+        #     f"A/R max={ratio.max().item():.3e}"
+        # )
+        return noise_scale
+
+    def _besq_delta_integer(self, R_k, A_bar, mu, xi, psi_scaled):
+        """
+        Exact BESQ^delta transition for positive integer delta..
+        Uses
+          chi'^2_delta(lambda) = (sqrt(lambda) + Z1)^2 + chi^2_{delta-1}
+
+        Z1 is coupled to the same xi used in x-update.
+        """
+        m = int(self.delta)
+        sqrt_2R = (2**0.5) * self._safe_sqrt_zero(R_k)
+
+        if m == 1:
+            residual = torch.zeros_like(R_k)
+        else:
+            z_rest = torch.randn(
+                (m - 1,) + tuple(R_k.shape),
+                dtype=R_k.dtype,
+                device=R_k.device
+            )
+
+            residual = (z_rest**2).sum(dim=0)
+
+        coupled_term = torch.sqrt(psi_scaled) * mu * xi
+        return 0.5 * ((sqrt_2R + coupled_term)**2 + A_bar * residual)
+
+    # def _besq_delta_noninteger(self, R_k, A_bar):
+    #     """
+    #     Exact BESQ^delta transition for delta >= 0 and delta not a positive integer.
+
+    #     Poisson-Gamma representation:
+    #         N ~ Poisson(R / A)
+    #         R_next | N ~ A * Gamma(N + delta/2, 1)
+
+    #     delta = 0 and N = 0 -> R_next = 0 (absorbing atom).
+    #     A = 0 -> R_next = R.
+    #     """
+    #     # No operational-time advance
+    #     no_step = A_bar <= 0
+    #     active = A_bar > 0
+
+    #     R_next = torch.where(no_step, R_k, torch.zeros_like(R_k))
+
+    #     if not active.any():
+    #         return R_next
+
+    #     # Poisson mixture
+    #     R_active = R_k[active]
+    #     A_active = A_bar[active]
+    #     lam = R_active / A_active
+    #     if not torch.isfinite(lam).all():
+    #         raise RuntimeError(
+    #             "Non-finite Poisson rate R/A "
+    #             f"for delta={self.delta}"
+    #         )
+
+    #     N = torch.poisson(lam)
+    #     concentration = N + 0.5 * self.delta
+    #     sampled = torch.zeros_like(R_active)
+
+    #     positive_shape = concentration > 0
+    #     if positive_shape.any():
+    #         gamma_dist = torch.distributions.Gamma(
+    #             concentration=concentration[positive_shape],
+    #             rate=torch.ones_like(
+    #                 concentration[positive_shape]
+    #             ),
+    #         )
+    #         G = gamma_dist.rsample()
+    #         sampled[positive_shape] = A_active[positive_shape] * G
+
+    #     R_next = R_next.clone()
+    #     R_next[active] = sampled
+    #     return R_next
+
+    def _besq_delta_noninteger(self, R_k, A_bar, mu, xi, psi_scaled):
+        """
+        BESQ^delta transition for delta >= 0 and non-integer delta.
+
+        Forward
+        -------
+        Exact BESQ marginal transition via Poisson-Gamma:
+            N ~ Poisson(R / A)
+            R_next | N ~ A * Gamma(N + delta/2, 1)
+
+        Special cases:
+            A = 0: R_next = R
+            delta = 0, N = 0: R_next = 0 (absorbing atom of BESQ^0)
+
+        Backward
+        --------
+        Biased Euler-BESQ surrogate:
+            R_next ~= R + (delta/2) A + sqrt(2 R A) Z
+        """
+        delta = float(self.delta)
+
+        if delta < 0.0:
+            raise ValueError(
+                f"delta must be >= 0, got {delta}"
+            )
+
+        # ---------------------------------------------------------
+        # Basic checks
+        # ---------------------------------------------------------
+        if not torch.isfinite(R_k).all():
+            raise RuntimeError(
+                "Non-finite BESQ state R_k."
+            )
+
+        if not torch.isfinite(A_bar).all():
+            raise RuntimeError(
+                "Non-finite BESQ operational increment A_bar."
+            )
+
+        if not torch.isfinite(psi_scaled).all():
+            raise RuntimeError(
+                "Non-finite psi_scaled."
+            )
+
+        if torch.any(R_k < 0):
+            raise RuntimeError(
+                "Negative BESQ state R_k encountered."
+            )
+
+        if torch.any(A_bar < 0):
+            raise RuntimeError(
+                "Negative BESQ operational increment A_bar encountered."
+            )
+
+        if torch.any(psi_scaled < 0):
+            raise RuntimeError(
+                "Negative psi_scaled encountered."
+            )
+
+        # No operational-time advance
+        no_step = A_bar <= 0
+        active = A_bar > 0
+
+        # 1. EXACT FORWARD: Poisson-Gamma sampling in float64 (lambda = R/A can become extremely large)
+        R_det = R_k.detach()
+        A_det = A_bar.detach()
+
+        # If A = 0: R_next = R.
+        R_hard = torch.where(no_step, R_det, torch.zeros_like(R_det))
+
+        if active.any():
+            R_active64 = R_det[active].double()
+            A_active64 = A_det[active].double()
+
+            lam64 = R_active64 / A_active64
+
+            if not torch.isfinite(lam64).all():
+                raise RuntimeError(
+                    "Non-finite Poisson rate R/A "
+                    f"for delta={delta}"
+                )
+
+            if torch.any(lam64 < 0):
+                raise RuntimeError(
+                    "Negative Poisson rate encountered."
+                )
+
+            # Exact Poisson draw
+            N64 = torch.poisson(lam64)
+            concentration64 = N64 + 0.5 * delta
+            sampled64 = torch.zeros_like(R_active64)
+
+            # For delta = 0 and N = 0:
+            positive_shape = concentration64 > 0
+            if positive_shape.any():
+
+                gamma_dist = torch.distributions.Gamma(
+                    concentration=(concentration64[positive_shape]),
+                    rate=torch.ones_like(concentration64[positive_shape]),
+                )
+
+                # Hard forward branch:
+                G64 = gamma_dist.sample()
+                sampled64[positive_shape] = A_active64[positive_shape] * G64
+
+            # Return BESQ state to the model dtype.
+            R_hard = R_hard.clone()
+            R_hard[active] = sampled64.to(dtype=R_hard.dtype)
+
+        # 2. EULER-BESQ SURROGATE BACKWARD
+        sqrt_2R = (math.sqrt(2.0) * self._safe_sqrt_zero(R_k))
+        coupled_noise = sqrt_2R * torch.sqrt(psi_scaled) * mu * xi
+        R_soft = R_k + 0.5 * delta * A_bar + coupled_noise
+
+        # A = 0:
+        R_soft = torch.where(no_step, R_k, R_soft)
+
+        # BESQ^0: R = 0 is truly absorbing.
+        if delta == 0.0:
+            absorbed = active & (R_det <= 0)
+
+            R_soft = torch.where(absorbed, torch.zeros_like(R_soft), R_soft)
+
+        # 3. STRAIGHT-THROUGH COMBINATION
+        R_next = R_hard + (R_soft - R_soft.detach())
+        return R_next
+
+    def _safe_sqrt_zero(self, x):
+        x_safe = torch.clamp(x, min=torch.finfo(x.dtype).tiny)
+        return torch.where(x > 0, torch.sqrt(x_safe), torch.zeros_like(x))
+
+    def _safe_noise_scale(self, R_k, c_k, log_psi, step, margin=5.0):
+        """
+        Compute sigma_k = sqrt(2 D_k) directly in log-domain.
+
+        The upper clamp is only a numerical overflow guard, not part of the BESQ dynamics.
+        """
+        dtype = R_k.dtype
+        finfo = torch.finfo(dtype)
+
+        positive = R_k > 0
+
+        # Avoid log(0); exact zeros are restored at the end.
+        R_safe = torch.clamp(R_k, min=finfo.tiny)
+
+        # log sigma_k = 1/2 [log(2) + log(R_k) + c_k - log_psi]
+        raw_log_sigma = 0.5 * (
+            math.log(2.0) + torch.log(R_safe) + c_k - log_psi
+        )
+
+        # NaN is not an ordinary overflow -> fail explicitly.
+        nan_mask = torch.isnan(raw_log_sigma) & positive
+        if nan_mask.any():
+            raise RuntimeError(
+                f"NaN in raw_log_sigma at step {step}: "
+                f"{nan_mask.sum().item()} elements"
+            )
+
+        # Leave some numerical headroom before dtype overflow.
+        log_sigma_max = math.log(finfo.max) - margin
+
+        # Elements requiring emergency clipping.
+        guard_mask = positive & (raw_log_sigma > log_sigma_max)
+        num_guarded = guard_mask.sum().item()
+
+        if step == 0:
+            self.noise_guard_calls = 0
+            self.noise_guard_elements = 0
+
+        if num_guarded > 0:
+            self.noise_guard_calls += 1
+            self.noise_guard_elements += num_guarded
+
+            total = R_k.numel()
+            rate = num_guarded / total
+
+            finite_raw = raw_log_sigma[torch.isfinite(raw_log_sigma)]
+
+            if finite_raw.numel() > 0:
+                max_finite = finite_raw.max().item()
+            else:
+                max_finite = float("nan")
+
+            num_pos_inf = torch.isposinf(raw_log_sigma).sum().item()
+
+            print(
+                f"[Noise guard] step={step} | "
+                f"clamped={num_guarded}/{total} "
+                f"({rate:.3e}) | "
+                f"+inf={num_pos_inf} | "
+                f"max_finite_log_sigma={max_finite:.3f} | "
+                f"guard_calls={self.noise_guard_calls} | "
+                f"total_clamped={self.noise_guard_elements}"
+            )
+
+        # Emergency clipping
+        log_sigma = torch.clamp(
+            raw_log_sigma,
+            max=log_sigma_max
+        )
+
+        sigma = torch.where(
+            positive,
+            torch.exp(log_sigma),
+            torch.zeros_like(R_k)
+        )
+
+        return sigma
